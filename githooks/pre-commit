@@ -1,0 +1,32 @@
+#!/bin/bash
+# Pre-commit hook: scan staged files for sensitive data before allowing commit
+
+set -euo pipefail
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$HOOK_DIR/.." && pwd)"
+
+# Collect staged files (new, modified)
+staged=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null || true)
+
+if [ -z "$staged" ]; then
+    exit 0
+fi
+
+# Convert newline-separated list to array
+mapfile -t staged_files <<< "$staged"
+
+echo "Running sensitive data scan on staged files..."
+
+# Run the checker against staged files
+"$REPO_ROOT/tests/check-sensitive.sh" "${staged_files[@]}"
+exit_code=$?
+
+if [ $exit_code -ne 0 ]; then
+    echo ""
+    echo "Commit blocked due to sensitive data. Review the matches above."
+    echo "If these are false positives, update tests/check-sensitive.sh to exclude them."
+    exit 1
+fi
+
+exit 0

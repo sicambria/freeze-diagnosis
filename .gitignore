@@ -1,0 +1,14 @@
+# Runtime logs (contain system telemetry, boot IDs, PIDs, process lists)
+logs/
+
+# Generated reports
+reports/
+
+# Rotated archives
+archive/
+
+# Editor / OS junk
+*~
+*.swp
+.DS_Store
+Thumbs.db

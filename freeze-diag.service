@@ -1,0 +1,18 @@
+[Unit]
+Description=Freeze Diagnosis Logger
+Documentation=https://github.com/local/freeze-diag
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/freeze-diag/diag-start.sh
+ExecStop=%h/.local/share/freeze-diag/diag-stop.sh
+Restart=no
+StandardOutput=journal
+StandardError=journal
+KillMode=mixed
+TimeoutStopSec=10
+
+[Install]
+WantedBy=graphical-session.target

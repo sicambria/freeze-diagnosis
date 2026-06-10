@@ -1,0 +1,8 @@
+# freeze-diag sudoers drop-in
+# Allows passwordless execution of dmesg, journalctl, and amdgpu debug_mask writes
+# Install to: /etc/sudoers.d/freeze-diag
+# chmod 0440 /etc/sudoers.d/freeze-diag
+
+<USERNAME> ALL=(ALL) NOPASSWD: /usr/bin/dmesg
+<USERNAME> ALL=(ALL) NOPASSWD: /usr/bin/journalctl
+<USERNAME> ALL=(ALL) NOPASSWD: /usr/bin/tee /sys/module/amdgpu/parameters/debug_mask
