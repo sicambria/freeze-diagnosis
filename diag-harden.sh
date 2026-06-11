@@ -11,6 +11,13 @@
 #   diag-harden.sh --disable-deep-cstates              Fix Ryzen deep C-state/SMM lockups
 #   diag-harden.sh --fix-all                          Apply all four above
 #   diag-harden.sh --dry-run                          Show what --fix-all would do, no changes
+#
+# Targeted experiments (NOT part of --fix-all; apply one at a time):
+#   diag-harden.sh --disable-cpu-boost                 Turbo boost off now + persist (HW marginality mitigation)
+#   diag-harden.sh --enable-cpu-boost                  Re-enable turbo boost, remove persistence
+#   diag-harden.sh --enable-iommu-strict               GRUB iommu.strict=1 (rogue-DMA corruption becomes visible IO_PAGE_FAULTs)
+#   diag-harden.sh --relax-panic                       Revert panic-on-lockup posture (after system proven stable)
+#
 #   diag-harden.sh --help                             Show this message
 
 set -euo pipefail
@@ -265,6 +272,30 @@ show_status() {
     done
 
     echo ""
+    echo -e "${BOLD}Runtime hardware posture:${NC}"
+    local boost taint
+    boost=$(cat "$BOOST_PATH" 2>/dev/null || echo "n/a")
+    taint=$(cat /proc/sys/kernel/tainted 2>/dev/null || echo "n/a")
+    if [ "$boost" = "0" ]; then
+        ok "${BOLD}CPU turbo boost${NC} = ${GREEN}disabled${NC} (marginality mitigation active)"
+    else
+        info "${BOLD}CPU turbo boost${NC} = ${boost} (1 = enabled)"
+    fi
+    if systemctl is-enabled disable-cpu-boost.service > /dev/null 2>&1; then
+        ok "boost-off persistence: ${GREEN}enabled${NC} (disable-cpu-boost.service)"
+    fi
+    if grep -qw 'iommu.strict=1' /proc/cmdline 2>/dev/null; then
+        ok "${BOLD}iommu.strict=1${NC} active this boot (DMA faults visible)"
+    fi
+    if [ "$taint" = "0" ] || [ "$taint" = "n/a" ]; then
+        ok "${BOLD}kernel tainted${NC} = ${taint}"
+    elif [ "$taint" = "64" ]; then
+        ok "${BOLD}kernel tainted${NC} = 64 (TAINT_USER only — expected with amdgpu.gpu_recovery=1)"
+    else
+        warn "${BOLD}kernel tainted${NC} = ${taint} (decode: bit 7=DIE/oops fired, bit 9=warn fired, bit 6=user)"
+    fi
+
+    echo ""
     echo -e "${BOLD}Persistence files:${NC}"
     if [ -f "$SYSCTL_FILE" ]; then
         echo -e "  ${CYAN}$SYSCTL_FILE${NC}:"
@@ -365,6 +396,97 @@ apply_disable_deep_cstates() {
     local target="LINUX"
     add_grub_params "$target" "Ryzen deep C-state lockup fix" \
         "processor.max_cstate=1" "idle=nomwait"
+}
+
+BOOST_PATH=/sys/devices/system/cpu/cpufreq/boost
+BOOST_UNIT=/etc/systemd/system/disable-cpu-boost.service
+
+apply_disable_cpu_boost() {
+    header "Experiment: Disable CPU Turbo Boost"
+    echo -e "  Mitigation for suspected hardware marginality under boost-clock"
+    echo -e "  transients (random single-bit corruption, memtest-clean RAM)."
+    echo -e "  Applies immediately (no reboot) and persists via a systemd unit."
+    echo -e "  Cost: peak single-core clock drops to base; sustained multicore"
+    echo -e "  throughput barely changes."
+    echo ""
+
+    [ -w "$BOOST_PATH" ] || [ -e "$BOOST_PATH" ] || { warn "$BOOST_PATH not present on this system"; return 1; }
+
+    echo 0 | sudo tee "$BOOST_PATH" > /dev/null
+    ok "boost = $(cat "$BOOST_PATH" 2>/dev/null) (0 = disabled)"
+
+    sudo tee "$BOOST_UNIT" > /dev/null <<'UNITEOF'
+[Unit]
+Description=Disable CPU turbo boost (stability mitigation, freeze-diag harden)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo 0 > /sys/devices/system/cpu/cpufreq/boost'
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable disable-cpu-boost.service > /dev/null 2>&1
+    ok "Persisted across reboots (disable-cpu-boost.service enabled)"
+    info "Rollback: $0 --enable-cpu-boost"
+}
+
+apply_enable_cpu_boost() {
+    header "Re-enable CPU Turbo Boost"
+    sudo systemctl disable disable-cpu-boost.service > /dev/null 2>&1 || true
+    sudo rm -f "$BOOST_UNIT"
+    sudo systemctl daemon-reload
+    echo 1 | sudo tee "$BOOST_PATH" > /dev/null 2>&1 || true
+    ok "boost = $(cat "$BOOST_PATH" 2>/dev/null) (1 = enabled); persistence removed"
+}
+
+apply_iommu_strict() {
+    header "Experiment: Strict IOMMU (DMA fault visibility)"
+    echo -e "  With lazy IOMMU, a misbehaving device (GPU, WiFi, NVMe) can DMA"
+    echo -e "  into freed/foreign memory and silently corrupt the kernel —"
+    echo -e "  indistinguishable from RAM bit flips. ${BOLD}iommu.strict=1${NC} makes"
+    echo -e "  every such access an immediate, attributable AMD-Vi IO_PAGE_FAULT."
+    echo -e "  Cost: a few % I/O overhead. Diagnostic posture, revert when done."
+    echo ""
+
+    if has_grub_param "DEFAULT" "iommu.strict=1" || has_grub_param "LINUX" "iommu.strict=1"; then
+        ok "iommu.strict=1 already present in GRUB"
+        return 0
+    fi
+    add_grub_params "LINUX" "strict IOMMU TLB invalidation (DMA fault visibility)" \
+        "iommu.strict=1"
+}
+
+apply_relax_panic() {
+    header "Relax: panic-on-lockup posture → recover instead of reboot"
+    echo -e "  The inverse of --panic-on-lockup. Once the system has proven"
+    echo -e "  stable, panicking on every oops/lockup turns survivable events"
+    echo -e "  into reboots. This restores recover-in-place behavior."
+    echo -e "  (amdgpu recovery params and panic=10 GRUB fallback are kept.)"
+    echo ""
+
+    echo -e "${BOLD}Runtime sysctl settings (live immediately):${NC}"
+    SYSCTL_ENTRIES=""
+    set_sysctl_key "kernel.softlockup_panic" "0" "Recover from soft lockup (no panic)"
+    set_sysctl_key "kernel.hardlockup_panic" "0" "Recover from hard lockup (no panic)"
+    set_sysctl_key "kernel.hung_task_panic" "0"  "Log hung tasks without panicking"
+    set_sysctl_key "kernel.panic_on_oops"  "0"  "Contain oops without panicking"
+
+    # Rewrite (not append) the persisted file so =1 entries don't linger
+    if [ -f "$SYSCTL_FILE" ]; then
+        sudo sed -i \
+            -e 's/^kernel\.softlockup_panic=.*/kernel.softlockup_panic=0/' \
+            -e 's/^kernel\.hardlockup_panic=.*/kernel.hardlockup_panic=0/' \
+            -e 's/^kernel\.hung_task_panic=.*/kernel.hung_task_panic=0/' \
+            -e 's/^kernel\.panic_on_oops=.*/kernel.panic_on_oops=0/' \
+            "$SYSCTL_FILE"
+        ok "Rewrote persisted entries in ${BOLD}$SYSCTL_FILE${NC}"
+    else
+        install_sysctl_file
+    fi
+    info "Re-arm diagnostics anytime with: $0 --panic-on-lockup"
 }
 
 apply_panic_on_lockup() {
@@ -534,6 +656,15 @@ show_help() {
     echo "  --fix-all                 Apply all four above (with confirmation prompt)"
     echo "  --dry-run                 Show what --fix-all would do without changing anything"
     echo ""
+    echo "Targeted experiments (one variable at a time, NOT in --fix-all):"
+    echo "  --disable-cpu-boost       Turbo boost off now + persist via systemd unit"
+    echo "                            (mitigation/test for HW marginality under boost transients)"
+    echo "  --enable-cpu-boost        Re-enable turbo boost, remove persistence"
+    echo "  --enable-iommu-strict     GRUB iommu.strict=1 — rogue device DMA becomes"
+    echo "                            visible AMD-Vi IO_PAGE_FAULTs instead of silent corruption"
+    echo "  --relax-panic             Revert panic-on-lockup posture once the system is"
+    echo "                            proven stable (recover in place instead of rebooting)"
+    echo ""
     echo "  --help                    Show this message"
     echo ""
     echo "Example:"
@@ -587,6 +718,27 @@ case "${1:-}" in
             echo -e "  ${YELLOW}Run${NC} sudo update-grub ${YELLOW}then reboot to apply.${NC}"
         fi
         ;;
+    --disable-cpu-boost)
+        check_sudo
+        apply_disable_cpu_boost
+        ;;
+    --enable-cpu-boost)
+        check_sudo
+        apply_enable_cpu_boost
+        ;;
+    --enable-iommu-strict)
+        check_sudo
+        GRUB_UPDATED=false
+        apply_iommu_strict
+        if [ "$GRUB_UPDATED" = true ]; then
+            echo ""
+            echo -e "  ${YELLOW}Run${NC} sudo update-grub ${YELLOW}then reboot to apply.${NC}"
+        fi
+        ;;
+    --relax-panic)
+        check_sudo
+        apply_relax_panic
+        ;;
     --fix-all)
         check_sudo
         apply_fix_all
@@ -598,7 +750,7 @@ case "${1:-}" in
         show_help
         ;;
     *)
-        echo "Usage: $0 [--status | --dry-run | --fix-all | --enable-amdgpu-recovery | --disable-nvme-power-save | --disable-deep-cstates | --panic-on-lockup]"
+        echo "Usage: $0 [--status | --dry-run | --fix-all | --enable-amdgpu-recovery | --disable-nvme-power-save | --disable-deep-cstates | --panic-on-lockup | --disable-cpu-boost | --enable-cpu-boost | --enable-iommu-strict | --relax-panic]"
         echo "Try: $0 --help"
         exit 1
         ;;

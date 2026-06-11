@@ -77,6 +77,10 @@ while true; do
         echo "$NOW|status=NO_TARGETS" >> "$FD_CURRENT_SEGMENT"
     fi
 
+    # One fdatasync per cycle: an instant kernel death must not lose
+    # the final samples — that window is exactly what the RCA needs.
+    sync_file "$FD_CURRENT_SEGMENT"
+
     COUNTER=$((COUNTER + 1))
     if [ $((COUNTER % 12)) -eq 0 ]; then
         cleanup_old_segments "$STREAM" &

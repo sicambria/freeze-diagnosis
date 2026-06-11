@@ -13,8 +13,11 @@ SEGMENT="${FD_GPU_SEGMENT:-600}"
 
 # Primary guard: flock (survives orphans)
 flock_instance_guard "$FD_PID_DIR/freeze-diag-$STREAM.lock"
+
+# Resolve hwmon paths by chip name (hwmonN numbering varies per boot)
+fd_resolve_hwmons
 CARD_PATH="${FD_AMDGPU_CARD_PATH:-/sys/class/drm/card1/device}"
-HWMON_PATH="${FD_AMDGPU_HWMON_PATH:-/sys/class/hwmon/hwmon11}"
+HWMON_PATH="${FD_AMDGPU_HWMON_PATH}"
 
 if is_running "$PIDFILE"; then
     echo "[$(ts_iso)] gpu: already running" >&2

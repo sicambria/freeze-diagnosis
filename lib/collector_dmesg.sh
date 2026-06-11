@@ -57,6 +57,7 @@ sync_loop() {
         sleep 30
         echo "--- SYNCPOINT $(ts_iso) ---" >> "$FD_CURRENT_SEGMENT" 2>/dev/null
         record_xorg_status
+        sync_file "$FD_CURRENT_SEGMENT"
         # Segment rollover
         if should_roll_segment "$SEGMENT"; then
             open_segment "$STREAM" "$SEGMENT"
@@ -86,15 +87,17 @@ if ! sudo -n dmesg > /dev/null 2>&1; then
     exit 0
 fi
 
-# Capture dmesg (continuous)
+# Capture dmesg (continuous). fsync per line: kernel messages are rare
+# and the last ones before a panic are precisely the evidence we need —
+# an unsynced page cache line dies with the kernel.
 $FD_DMESG_CMD 2>/dev/null | while IFS= read -r line; do
-    echo "D: $line" >> "$FD_CURRENT_SEGMENT"
+    fsync_line "$FD_CURRENT_SEGMENT" "D: $line"
 done &
 DMESG_PID=$!
 
-# Capture journal (continuous)
+# Capture journal (continuous, warn-and-above only — low volume)
 $FD_JOURNAL_CMD 2>/dev/null | while IFS= read -r line; do
-    echo "J: $line" >> "$FD_CURRENT_SEGMENT"
+    fsync_line "$FD_CURRENT_SEGMENT" "J: $line"
 done &
 JOURNAL_PID=$!
 

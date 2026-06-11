@@ -82,7 +82,15 @@ find_freeze_time() {
             fi
         fi
 
-        for f in $pattern; do
+        # Bound the candidate set with find (mtime within the session
+        # window) — globbing all heartbeat segments doesn't scale to
+        # 90-day retention.
+        local candidates
+        candidates=$(find "$FD_LOGS" -maxdepth 1 -name 'heartbeat_*.log' \
+            -newermt "@$((session_start - 700))" \
+            ! -newermt "@$((cutoff + 120))" 2>/dev/null)
+        local f
+        for f in $candidates; do
             [ -f "$f" ] || continue
             local prev_ts=0
             local gap_hit=false
@@ -103,37 +111,50 @@ find_freeze_time() {
                 last_ts=$prev_ts
             fi
         done
+        # If last_ts is within 30s of cutoff (detected_at), it's from the
+        # recovery session, not the crash — pre-crash logs were purged.
+        if [ "$last_ts" -gt 0 ] && [ $((cutoff - last_ts)) -lt 30 ] 2>/dev/null; then
+            last_ts=0
+        fi
         echo "$last_ts"
         return
     fi
 
-    # Default: latest heartbeat across all logs (for current/live analysis)
-    for f in $pattern; do
-        [ -f "$f" ] || continue
+    # Default: latest heartbeat (for current/live analysis). Segment
+    # names embed sortable timestamps — only the newest file matters.
+    local newest
+    newest=$(ls -1 "$FD_LOGS"/heartbeat_*.log 2>/dev/null | sort | tail -1)
+    if [ -n "$newest" ]; then
         local tail_line
-        tail_line=$(tail -1 "$f" 2>/dev/null)
-        [[ "$tail_line" =~ ^([0-9]+) ]] || continue
-        local ts=${BASH_REMATCH[1]}
-        if [ "$ts" -gt "$last_ts" ] 2>/dev/null; then
-            last_ts=$ts
-        fi
-    done
+        tail_line=$(tail -1 "$newest" 2>/dev/null)
+        [[ "$tail_line" =~ ^([0-9]+) ]] && last_ts=${BASH_REMATCH[1]}
+    fi
     echo "$last_ts"
 }
 
+# grep over recent segments only — with 90-day retention the logs dir
+# holds tens of thousands of files; a full scan per category is unusable.
+# Window: 48h by default, wide enough for any "crashed yesterday" case
+# (older crashes have their evidence frozen in archive/ crash bundles).
 grep_logs() {
-    local pattern="$1" window_start="${2:-0}" window_end="${3:-9999999999}"
-    local logpat="$FD_LOGS/*_????????_??????.log"
-    # shellcheck disable=SC2086
-    for f in $logpat; do
-        [ -f "$f" ] || continue
-        grep -iE "$pattern" "$f" 2>/dev/null || true
-    done
+    local pattern="$1" maxage_min="${2:-2880}"
+    find "$FD_LOGS" -maxdepth 1 -name '*_????????_??????.log' \
+        -mmin "-${maxage_min}" -print0 2>/dev/null | \
+        xargs -0 -r grep -ahiE "$pattern" 2>/dev/null || true
 }
 
 grep_dmesg() {
     local pattern="$1"
-    grep_logs "^D: .*$pattern"
+    grep_logs "^D: .*($pattern)"
+}
+
+# Recent segment files of one stream (newest first). Bash line-by-line
+# parsers must only ever walk these, never the full 90-day set.
+recent_stream_files() {
+    local stream="$1" maxage_min="${2:-1440}"
+    find "$FD_LOGS" -maxdepth 1 -name "${stream}_????????_??????.log" \
+        -mmin "-${maxage_min}" -printf '%T@ %p\n' 2>/dev/null | \
+        sort -rn | head -20 | awk '{print $2}'
 }
 
 # ---- Journalctl helper (persists across same-boot recovery) ----
@@ -158,8 +179,111 @@ SCORE_NVME=0
 SCORE_MEM=0
 SCORE_THERMAL=0
 SCORE_LEAK=0
+SCORE_KERNEL=0
 GPU_POWER_ANOMALY=0
 PROCESS_TRIGGER=""
+KERNEL_EVIDENCE=""
+PSTORE_INFO=""
+CPU_FREQ_INFO=""
+CONTEXT_INFO=""
+
+# ---- Kernel fault analysis (the 2026-06 RCA killer category) ----
+# Scans the captured dmesg stream AND — when analyzing a crashed session —
+# the previous boot's journal for oops/GPF/lockup/MCE signatures. These are
+# kernel-level faults userspace cannot cause; their presence reclassifies
+# the whole incident.
+KERNEL_FAULT_PATTERN='BUG:|Oops|general protection|soft lockup|hung task|double fault|stack guard|invalid opcode|machine check|mce:.*(error|bank)|page fault.*kernel|RIP: 0010'
+
+analyze_kernel_faults() {
+    local freeze_ts="$1"
+    local matches jmatches
+    matches=$(grep_dmesg "$KERNEL_FAULT_PATTERN" | grep -vi 'MCE: In-kernel' || true)
+
+    # Crashed-session analysis: the decisive lines usually live in the
+    # *previous boot's* journal (this is how the bit-flip GPF was found).
+    if [ -n "${ANALYZE_SESSION:-}" ] && sudo -n true 2>/dev/null; then
+        jmatches=$(sudo -n journalctl -b -1 -o short-precise --no-pager 2>/dev/null | \
+            grep -aiE "$KERNEL_FAULT_PATTERN" | grep -vi 'MCE: In-kernel' | head -40 || true)
+        if [ -n "$jmatches" ]; then
+            matches+="${matches:+$'\n'}[journal -b -1]"$'\n'"$jmatches"
+        fi
+    fi
+
+    if echo "$matches" | grep -qiE 'general protection|Oops|BUG:|double fault|machine check'; then
+        SCORE_KERNEL=4
+    elif echo "$matches" | grep -qiE 'soft lockup|hung task|invalid opcode'; then
+        SCORE_KERNEL=3
+    fi
+    KERNEL_EVIDENCE="$matches"
+}
+
+# ---- pstore: kernel panic records ----
+# Lists records near the freeze; root-only contents are noted (and are
+# auto-copied into crash bundles when fd-pstore-dump is installed).
+analyze_pstore() {
+    local freeze_ts="$1" info="" d mt
+    for d in /var/lib/systemd/pstore/* /sys/fs/pstore/*; do
+        [ -e "$d" ] || continue
+        mt=$(stat -c %Y "$d" 2>/dev/null) || continue
+        # Records written within 1h before .. 24h after the freeze
+        if [ "$mt" -ge $((freeze_ts - 3600)) ] && [ "$mt" -le $((freeze_ts + 86400)) ]; then
+            info+="  $(date -d "@$mt" '+%F %T' 2>/dev/null)  $d"$'\n'
+        fi
+    done
+    PSTORE_INFO="$info"
+    if [ -n "$info" ] && [ "$SCORE_KERNEL" -lt 3 ]; then
+        SCORE_KERNEL=3   # a panic record exists even if no text was captured
+    fi
+}
+
+# ---- CPU frequency posture before death (cpu stream) ----
+analyze_cpu_freq() {
+    local freeze_ts="$1" window=120
+    local n=0 max_seen=0 boost_last="?" taint_last="?" nhi_max=0 f
+    for f in $(recent_stream_files cpu); do
+        while IFS='|' read -ra fields; do
+            local ts=${fields[0]}
+            [[ "$ts" =~ ^[0-9]+$ ]] || continue
+            (( freeze_ts - ts <= window && freeze_ts - ts >= 0 )) 2>/dev/null || continue
+            local field
+            for field in "${fields[@]}"; do
+                case "$field" in
+                    fmax=*)  local v=${field#fmax=}
+                             [ "$v" -gt "$max_seen" ] 2>/dev/null && max_seen=$v ;;
+                    nhi=*)   local h=${field#nhi=}
+                             [ "$h" -gt "$nhi_max" ] 2>/dev/null && nhi_max=$h ;;
+                    boost=*) boost_last=${field#boost=} ;;
+                    taint=*) taint_last=${field#taint=} ;;
+                esac
+            done
+            n=$((n + 1))
+        done < "$f"
+    done
+    if [ "$n" -gt 0 ]; then
+        CPU_FREQ_INFO="  samples=$n in last ${window}s | peak core freq ${max_seen}MHz | max cores >90% fmax: $nhi_max | boost=$boost_last | tainted=$taint_last"
+    fi
+}
+
+# ---- Context snapshot of the analyzed session ----
+load_context() {
+    local id="${ANALYZE_SESSION:-}" ctx=""
+    [ -n "$id" ] && ctx="$FD_LOGS/context_${id}.log"
+    if [ ! -f "$ctx" ]; then
+        ctx=$(ls -1t "$FD_LOGS"/context_*.log 2>/dev/null | head -1 || true)
+    fi
+    if [ -n "$ctx" ] && [ -f "$ctx" ]; then
+        CONTEXT_INFO=$(grep -aE '^(Linux|cmdline|bios_version|bios_date|microcode|boost|governor|tainted|amd_pstate)' "$ctx" 2>/dev/null | sed 's/^/  /' || true)
+    fi
+    return 0
+}
+
+# NOTE: analyze_gpu/oom/nvme set their SCORE_* and *_EVIDENCE globals
+# directly. They must be called as plain statements, never in $(...) —
+# a subshell would silently discard the scores (that exact bug shipped
+# in v2: GPU/OOM/NVMe severity always displayed NONE).
+GPU_EVIDENCE=""
+OOM_EVIDENCE=""
+NVME_EVIDENCE=""
 
 analyze_gpu() {
     local freeze_ts="$1"
@@ -192,7 +316,7 @@ analyze_gpu() {
     # Also check for GPU power anomaly (high power at low utilization = hang signature)
     analyze_gpu_power_anomaly "$freeze_ts"
 
-    echo "$matches"
+    GPU_EVIDENCE="$matches"
 }
 
 analyze_gpu_power_anomaly() {
@@ -201,7 +325,7 @@ analyze_gpu_power_anomaly() {
     local anomaly_found=false
     local highest_ratio=0
 
-    for f in "$FD_LOGS"/gpu_*.log; do
+    for f in $(recent_stream_files gpu); do
         [ -f "$f" ] || continue
         while IFS='|' read -ra fields; do
             local ts=${fields[0]}
@@ -248,7 +372,7 @@ analyze_process_triggers() {
     local early_seen=false
     local xorg_early_rss=0 xorg_late_rss=0
 
-    for f in "$FD_LOGS"/fast_*.log; do
+    for f in $(recent_stream_files fast); do
         [ -f "$f" ] || continue
         while IFS='|' read -ra fields; do
             local ts=${fields[0]}
@@ -321,7 +445,7 @@ analyze_process_triggers() {
 
     # Per-process RSS growth from watchdog in last 5 minutes
     local -A watchdog_rss_early watchdog_rss_late watchdog_pname
-    for f in "$FD_LOGS"/watchdog_*.log; do
+    for f in $(recent_stream_files watchdog); do
         [ -f "$f" ] || continue
         while IFS='|' read -ra fields; do
             local ts=${fields[0]}
@@ -381,27 +505,29 @@ analyze_oom() {
     if [ "$count" -gt 0 ]; then
         SCORE_OOM=4
     fi
-    echo "$matches"
+    OOM_EVIDENCE="$matches"
 }
 
 analyze_nvme() {
     local freeze_ts="$1"
     local matches
-    matches=$(grep_dmesg "nvme.*I/O|nvme.*abort|nvme.*timeout|nvme.*fault|nvme.*controller")
+    # \bfault: plain "fault" also matches "default_ps_max_latency_us"
+    # in every captured kernel cmdline (false positive)
+    matches=$(grep_dmesg "nvme.*I/O error|nvme.*abort|nvme.*timeout|nvme.*\bfault|nvme.*controller (down|reset)")
     local count
     count=$(echo "$matches" | grep -c . 2>/dev/null || true)
     count=${count:-0}
     if [ "$count" -gt 0 ]; then
         SCORE_NVME=3
     fi
-    echo "$matches"
+    NVME_EVIDENCE="$matches"
 }
 
 analyze_memory_pressure() {
     local freeze_ts="$1"
     local evidence=""
 
-    for f in "$FD_LOGS"/fast_*.log; do
+    for f in $(recent_stream_files fast); do
         [ -f "$f" ] || continue
         while IFS='|' read -ra fields; do
             local ts=${fields[0]}
@@ -432,7 +558,7 @@ analyze_memory_pressure() {
 analyze_thermal() {
     local freeze_ts="$1"
     local max_gpu=0 max_cpu=0
-    for f in "$FD_LOGS"/fast_*.log; do
+    for f in $(recent_stream_files fast); do
         [ -f "$f" ] || continue
         while IFS='|' read -ra fields; do
             local ts=${fields[0]}
@@ -529,14 +655,20 @@ generate_report() {
     local ftime_str
     ftime_str=$(date -d "@$freeze_ts" --iso-8601=seconds 2>/dev/null || echo "$freeze_ts")
 
-    local gpu_evidence oom_evidence nvme_evidence
-    gpu_evidence=$(analyze_gpu "$freeze_ts")
-    oom_evidence=$(analyze_oom "$freeze_ts")
-    nvme_evidence=$(analyze_nvme "$freeze_ts")
+    # Plain calls (NOT $(...)): these set SCORE_* and *_EVIDENCE globals;
+    # a subshell would discard the scores.
+    analyze_gpu "$freeze_ts"
+    analyze_oom "$freeze_ts"
+    analyze_nvme "$freeze_ts"
+    local gpu_evidence="$GPU_EVIDENCE" oom_evidence="$OOM_EVIDENCE" nvme_evidence="$NVME_EVIDENCE"
     analyze_memory_pressure "$freeze_ts"
     analyze_thermal "$freeze_ts"
     analyze_process_triggers "$freeze_ts"
     analyze_leak "$freeze_ts"
+    analyze_kernel_faults "$freeze_ts"
+    analyze_pstore "$freeze_ts"
+    analyze_cpu_freq "$freeze_ts"
+    load_context
 
     local same_boot_info
     same_boot_info=$(check_same_boot_crashes "${CURRENT_BOOT:-}" "${ANALYZE_SESSION:-}")
@@ -553,10 +685,38 @@ generate_report() {
             echo "Same-boot crashes: $crash_count previous crash(es) in this boot"
             while IFS= read -r l; do echo "  $l"; done <<< "$crash_list"
         fi
+        if [ -n "$CONTEXT_INFO" ]; then
+            echo "SESSION CONTEXT (kernel / firmware / freq posture)"
+            echo "$CONTEXT_INFO"
+        fi
         echo ""
 
         echo "FINDINGS (severity: ████ HIGH  ███ MEDIUM  ██ LOW  █ NONE)"
         echo ""
+
+        # Kernel faults first — if present they reclassify everything else
+        echo "$(severity_blocks "$SCORE_KERNEL") KERNEL FAULT ($(severity_label "$SCORE_KERNEL"))"
+        if [ -n "$KERNEL_EVIDENCE" ]; then
+            echo "$KERNEL_EVIDENCE" | head -15 | while IFS= read -r l; do echo "  $l"; done
+            echo "  NOTE: oops/GPF/lockup lines are kernel-level faults that"
+            echo "  userspace cannot cause — suspect kernel bug or hardware"
+            echo "  (repeated single-bit pointer corruption across kernels = HW)."
+        else
+            echo "  No kernel oops/GPF/lockup/MCE evidence captured."
+        fi
+        if [ -n "$PSTORE_INFO" ]; then
+            echo "  Panic records (pstore) near this freeze:"
+            printf '%s' "$PSTORE_INFO"
+            echo "  (root-only; auto-copied into archive/ crash bundles when fd-pstore-dump is installed)"
+        fi
+        echo ""
+
+        # CPU frequency posture at death
+        if [ -n "$CPU_FREQ_INFO" ]; then
+            echo "CPU FREQ BEFORE FREEZE (transient/boost forensics)"
+            echo "$CPU_FREQ_INFO"
+            echo ""
+        fi
 
         # GPU
         if [ "$GPU_ONLY" = false ] || [ "$GPU_ONLY" = true ]; then
@@ -567,7 +727,7 @@ generate_report() {
             if [ "$GPU_POWER_ANOMALY" != 0 ]; then
                 echo "  GPU power anomaly: ${GPU_POWER_ANOMALY}W per % busy (threshold >4.0)"
             fi
-            if [ -z "$gpu_evidence" ] && [ "$GPU_POWER_ANOMALY" -eq 0 ]; then
+            if [ -z "$gpu_evidence" ] && [ "$GPU_POWER_ANOMALY" = 0 ]; then
                 echo "  No GPU fault evidence in dmesg or journal."
             fi
             echo ""
@@ -635,10 +795,10 @@ generate_report() {
         # Raw excerpts
         echo "RAW LOG EXCERPTS (last 10 lines each stream)"
         echo "─────────────────────────────────────────────"
-        for stream in heartbeat fast gpu watchdog detailed dmesg; do
+        for stream in heartbeat fast cpu gpu watchdog detailed dmesg; do
             echo "--- $stream ---"
             local lf
-            lf=$(ls -t "$FD_LOGS/${stream}_"*.log 2>/dev/null | head -1)
+            lf=$(ls -t "$FD_LOGS/${stream}_"*.log 2>/dev/null | head -1 || true)
             if [ -n "$lf" ]; then
                 tail -10 "$lf" 2>/dev/null || echo "(empty)"
             else
@@ -779,9 +939,19 @@ if [ "$HAD_ARGS" = false ] || [ "$INTERACTIVE_MODE" = true ]; then
         fi
 
         FREEZE_TS=$(find_freeze_time "${ANALYZE_SESSION:-}")
+        # Fallback: when pre-crash logs are purged, use session marker detected_at
         if [ -z "$FREEZE_TS" ] || [ "$FREEZE_TS" -eq 0 ]; then
-            echo "No heartbeat logs found. Ensure collectors are running." >&2
-            continue
+            if [ -n "$session_file" ] && [ -f "$session_file" ]; then
+                detected_fallback=$(grep -o '"detected_at": *"[^"]*"' "$session_file" 2>/dev/null | head -1 | cut -d'"' -f4)
+                if [ -n "$detected_fallback" ]; then
+                    FREEZE_TS=$(date -d "$detected_fallback" +%s 2>/dev/null || echo 0)
+                    [ "$FREEZE_TS" -ne 0 ] || echo "Warning: pre-crash data purged — using detection time." >&2
+                fi
+            fi
+            if [ -z "$FREEZE_TS" ] || [ "$FREEZE_TS" -eq 0 ]; then
+                echo "No heartbeat logs found. Ensure collectors are running." >&2
+                continue
+            fi
         fi
 
         REPORT_FILE="${OUTPUT_FILE:-$FD_REPORTS/report_$(ts_dt).txt}"
@@ -832,9 +1002,19 @@ else
     fi
 
     FREEZE_TS=$(find_freeze_time "${ANALYZE_SESSION:-}")
+    # Fallback: when pre-crash logs are purged, use session marker detected_at
     if [ -z "$FREEZE_TS" ] || [ "$FREEZE_TS" -eq 0 ]; then
-        echo "No heartbeat logs found. Ensure collectors are running." >&2
-        exit 1
+        if [ -n "$session_file" ] && [ -f "$session_file" ]; then
+            detected_fallback2=$(grep -o '"detected_at": *"[^"]*"' "$session_file" 2>/dev/null | head -1 | cut -d'"' -f4)
+            if [ -n "$detected_fallback2" ]; then
+                FREEZE_TS=$(date -d "$detected_fallback2" +%s 2>/dev/null || echo 0)
+                [ "$FREEZE_TS" -ne 0 ] || echo "Warning: pre-crash data purged — using detection time." >&2
+            fi
+        fi
+        if [ -z "$FREEZE_TS" ] || [ "$FREEZE_TS" -eq 0 ]; then
+            echo "No heartbeat logs found. Ensure collectors are running." >&2
+            exit 1
+        fi
     fi
 
     REPORT_FILE="${OUTPUT_FILE:-$FD_REPORTS/report_$(ts_dt).txt}"

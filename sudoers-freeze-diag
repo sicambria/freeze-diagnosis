@@ -1,8 +1,10 @@
 # freeze-diag sudoers drop-in
-# Allows passwordless execution of dmesg, journalctl, and amdgpu debug_mask writes
+# Allows passwordless execution of dmesg, journalctl, amdgpu debug_mask
+# writes, and the pstore dump helper (root-owned, validates its target).
 # Install to: /etc/sudoers.d/freeze-diag
 # chmod 0440 /etc/sudoers.d/freeze-diag
 
 <USERNAME> ALL=(ALL) NOPASSWD: /usr/bin/dmesg
 <USERNAME> ALL=(ALL) NOPASSWD: /usr/bin/journalctl
 <USERNAME> ALL=(ALL) NOPASSWD: /usr/bin/tee /sys/module/amdgpu/parameters/debug_mask
+<USERNAME> ALL=(ALL) NOPASSWD: /usr/local/bin/fd-pstore-dump

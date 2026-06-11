@@ -14,6 +14,9 @@ SEGMENT="${FD_FAST_SEGMENT:-600}"
 # Primary guard: flock (survives orphans)
 flock_instance_guard "$FD_PID_DIR/freeze-diag-$STREAM.lock"
 
+# Resolve hwmon paths by chip name (hwmonN numbering varies per boot)
+fd_resolve_hwmons
+
 if is_running "$PIDFILE"; then
     echo "[$(ts_iso)] fast: already running" >&2
     exit 0

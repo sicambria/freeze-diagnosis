@@ -8,8 +8,11 @@ else
     return 0
 fi
 
-# Source config if not already sourced
-if [ -z "${FD_ROOT:-}" ]; then
+# Source config if not already sourced. Check FD_LOGS (not FD_ROOT):
+# FD_ROOT alone in the environment must not skip the config, or every
+# derived path (FD_LOGS, FD_LIB, ...) would be empty and writes would
+# target "/".
+if [ -z "${FD_LOGS:-}" ]; then
     _cfg="$(dirname "$(dirname "${BASH_SOURCE[0]:-$0}")")/diag.conf"
     [ -f "$_cfg" ] && source "$_cfg"
 fi
@@ -37,12 +40,16 @@ current_boot_id() {
 fsync_line() {
     local file="$1" line="$2"
     printf '%s\n' "$line" >> "$file" 2>/dev/null || return 1
-    local dir
-    dir="$(dirname "$file")"
-    if [ -d "$dir" ]; then
-        sync -f -- "$dir" 2>/dev/null
-    fi
+    sync_file "$file"
     return 0
+}
+
+# ---- Durably flush an already-written file ----
+# sync -d = fdatasync(2) on just this file (much cheaper than syncing
+# the whole filesystem); falls back for old coreutils.
+sync_file() {
+    local file="$1"
+    sync -d -- "$file" 2>/dev/null || sync -f -- "$(dirname "$file")" 2>/dev/null || true
 }
 
 # ---- Durable heartbeat (strongest guarantee) ----
@@ -81,22 +88,13 @@ should_roll_segment() {
 }
 
 # ---- Cleanup old segments ----
+# Single find process instead of a per-file bash loop: with long
+# retention (90 days) the logs dir holds tens of thousands of segments
+# and a glob+stat loop would burn CPU every collector cycle.
 cleanup_old_segments() {
     local stream="${1:-*}" retention_min="${2:-$FD_RETENTION_MINUTES}"
-    local cutoff cutoff_epoch pattern
-    cutoff_epoch=$(($(ts_epoch) - retention_min * 60))
-    if [ "$stream" = "*" ]; then
-        pattern="${FD_LOGS}/*_????????_??????.log"
-    else
-        pattern="${FD_LOGS}/${stream}_????????_??????.log"
-    fi
-    # shellcheck disable=SC2086
-    for f in $pattern; do
-        [ -f "$f" ] || continue
-        local ftime
-        ftime=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null)
-        [ -n "$ftime" ] && [ "$ftime" -lt "$cutoff_epoch" ] && rm -f "$f"
-    done
+    find "$FD_LOGS" -maxdepth 1 -name "${stream}_????????_??????.log" \
+        -type f -mmin "+${retention_min}" -delete 2>/dev/null
 }
 
 # ---- Global size check and prune ----
@@ -116,15 +114,16 @@ size_check_and_prune() {
     local max_kb=$((max_mb * 1024))
     [ "$total_kb" -le "$max_kb" ] && return 0
     target_kb=$((max_kb * 70 / 100))
-    # Delete oldest files first (by mtime, across all streams)
-    find "$FD_LOGS" -name '*_????????_??????.log' -type f -printf '%T@ %p\n' 2>/dev/null | \
-        sort -n | while read -r _ f; do
-        [ -f "$f" ] || continue
-        rm -f "$f"
-        total_kb=$(du -s --block-size=1K "$FD_LOGS" 2>/dev/null | awk '{print $1}')
-        [ -z "$total_kb" ] && break
-        [ "$total_kb" -le "$target_kb" ] && break
-    done
+    # Delete oldest files first (by mtime, across all streams).
+    # One listing with sizes — no du re-scan per deleted file.
+    find "$FD_LOGS" -maxdepth 1 -name '*_????????_??????.log' -type f \
+        -printf '%T@ %k %p\n' 2>/dev/null | sort -n | \
+        while read -r _ fkb f; do
+            [ -f "$f" ] || continue
+            rm -f "$f"
+            total_kb=$((total_kb - fkb))
+            [ "$total_kb" -le "$target_kb" ] && break
+        done
 }
 
 # ---- Find target processes ----
@@ -160,6 +159,37 @@ proc_info() {
 sysfs_val() {
     local p="$1"
     [ -r "$p" ] && cat "$p" 2>/dev/null || echo ""
+}
+
+# ---- Resolve hwmon path by chip name ----
+# hwmonN numbering is NOT stable across boots (probe order), so configured
+# paths like /sys/class/hwmon/hwmon11 silently break and temps read 0.
+# resolve_hwmon <chip-name>  →  /sys/class/hwmon/hwmonN (or empty)
+resolve_hwmon() {
+    local want="$1" f
+    for f in /sys/class/hwmon/hwmon*/name; do
+        [ -r "$f" ] || continue
+        if [ "$(<"$f")" = "$want" ]; then
+            dirname "$f"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Resolve the three configured hwmon paths if they are "auto" or stale.
+# Call once at collector startup, after sourcing diag.conf.
+fd_resolve_hwmons() {
+    if [ "${FD_CPU_HWMON_PATH:-auto}" = "auto" ] || [ ! -r "${FD_CPU_HWMON_PATH}/temp1_input" ]; then
+        FD_CPU_HWMON_PATH=$(resolve_hwmon "${FD_CPU_HWMON_NAME:-k10temp}") || FD_CPU_HWMON_PATH=""
+    fi
+    if [ "${FD_AMDGPU_HWMON_PATH:-auto}" = "auto" ] || [ ! -r "${FD_AMDGPU_HWMON_PATH}/temp1_input" ]; then
+        FD_AMDGPU_HWMON_PATH=$(resolve_hwmon "${FD_AMDGPU_HWMON_NAME:-amdgpu}") || FD_AMDGPU_HWMON_PATH=""
+    fi
+    if [ "${FD_NVME_HWMON_PATH:-auto}" = "auto" ] || [ ! -r "${FD_NVME_HWMON_PATH}/temp1_input" ]; then
+        FD_NVME_HWMON_PATH=$(resolve_hwmon "${FD_NVME_HWMON_NAME:-nvme}") || FD_NVME_HWMON_PATH=""
+    fi
+    export FD_CPU_HWMON_PATH FD_AMDGPU_HWMON_PATH FD_NVME_HWMON_PATH
 }
 
 # ---- is_running check via PID file ----

@@ -1,0 +1,51 @@
+#!/bin/bash
+# fd-pstore-dump — copy kernel panic records (pstore) to a user directory.
+#
+# Installed root-owned at /usr/local/bin/fd-pstore-dump by
+# `diag-start.sh --install`, and allowed via the freeze-diag sudoers
+# drop-in. pstore records (/var/lib/systemd/pstore, /sys/fs/pstore) are
+# root-only, which during the 2026-06 RCA repeatedly left the only real
+# panic backtraces uninspected. This helper closes that gap safely:
+# the destination must be an existing directory owned by the invoking
+# (sudo) user, and only pstore content is ever read.
+#
+# Usage: sudo fd-pstore-dump <dest-dir>
+
+set -euo pipefail
+
+DEST="${1:?usage: fd-pstore-dump <dest-dir>}"
+
+[ "$(id -u)" -eq 0 ] || { echo "fd-pstore-dump: must run as root (via sudo)" >&2; exit 1; }
+CALLER_UID="${SUDO_UID:-0}"
+[ "$CALLER_UID" != "0" ] || { echo "fd-pstore-dump: refusing without SUDO_UID (run via sudo, not as root shell)" >&2; exit 1; }
+
+DEST="$(realpath -e -- "$DEST")" || { echo "fd-pstore-dump: dest does not exist" >&2; exit 1; }
+[ -d "$DEST" ] || { echo "fd-pstore-dump: dest is not a directory" >&2; exit 1; }
+DEST_UID="$(stat -c %u -- "$DEST")"
+[ "$DEST_UID" = "$CALLER_UID" ] || {
+    echo "fd-pstore-dump: dest must be owned by the invoking user (uid $CALLER_UID)" >&2
+    exit 1
+}
+
+OUT="$DEST/pstore"
+mkdir -p "$OUT"
+
+copied=0
+for src in /var/lib/systemd/pstore /sys/fs/pstore; do
+    [ -d "$src" ] || continue
+    label=$(basename "$(dirname "$src")")-$(basename "$src")
+    ls -laR "$src" > "$OUT/listing-$label.txt" 2>/dev/null || true
+    # cp -r preserves the record directory structure (e.g. <ts>/001/dmesg.txt)
+    if [ -n "$(ls -A "$src" 2>/dev/null)" ]; then
+        cp -r -- "$src" "$OUT/copy-$label" 2>/dev/null && copied=1
+    fi
+done
+
+chown -R "$CALLER_UID:${SUDO_GID:-$CALLER_UID}" "$OUT"
+chmod -R u+rwX,go-rwx "$OUT"
+
+if [ "$copied" -eq 1 ]; then
+    echo "fd-pstore-dump: pstore records copied to $OUT"
+else
+    echo "fd-pstore-dump: no pstore records present (listings written to $OUT)"
+fi

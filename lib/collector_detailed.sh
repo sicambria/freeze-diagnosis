@@ -103,6 +103,9 @@ while true; do
         echo ""
     } >> "$FD_CURRENT_SEGMENT"
 
+    # Durable flush — snapshots must survive an instant kernel death
+    sync_file "$FD_CURRENT_SEGMENT"
+
     COUNTER=$((COUNTER + 1))
     if [ $((COUNTER % 5)) -eq 0 ]; then
         cleanup_old_segments "$STREAM" &

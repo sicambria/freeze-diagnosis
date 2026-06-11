@@ -53,6 +53,23 @@ if [ "${1:-}" = "--install" ]; then
         echo "  [INFO] sudo dmesg not available — kernel capture will be disabled"
         echo "         (collectors still run fine without it)"
     fi
+
+    # ---- Install pstore dump helper (root-owned) ----
+    PSTORE_SRC="$SCRIPT_DIR/bin/fd-pstore-dump"
+    PSTORE_DST="${FD_PSTORE_DUMP_BIN:-/usr/local/bin/fd-pstore-dump}"
+    if [ -f "$PSTORE_SRC" ]; then
+        if cmp -s "$PSTORE_SRC" "$PSTORE_DST" 2>/dev/null; then
+            echo "  [SKIP] pstore helper up-to-date: $PSTORE_DST"
+        elif sudo -n true 2>/dev/null || [ "$(id -u)" -eq 0 ]; then
+            sudo cp "$PSTORE_SRC" "$PSTORE_DST"
+            sudo chown root:root "$PSTORE_DST"
+            sudo chmod 0755 "$PSTORE_DST"
+            echo "  [OK] Installed $PSTORE_DST (panic records become harvestable)"
+        else
+            echo "  [WARN] Could not install $PSTORE_DST (needs sudo). Run manually:"
+            echo "         sudo cp $PSTORE_SRC $PSTORE_DST && sudo chmod 0755 $PSTORE_DST"
+        fi
+    fi
     echo ""
 
     # ---- Step 2: Install systemd user service ----
@@ -288,6 +305,44 @@ echo "[$(ts_iso)] diag-start: boot=$CURRENT_BOOT session=$SESSION_ID pid=$$" >> 
 # Write unique session marker (never overwrites previous crash data)
 write_session_marker "running" "$SESSION_ID"
 
+# ---- Boot context snapshot (once per session) ----
+# Captures the platform state every post-crash RCA needs but no periodic
+# collector records: kernel, cmdline, BIOS/microcode, boost, panic posture.
+write_context_snapshot() {
+    local ctx="$FD_LOGS/context_${SESSION_ID}.log"
+    {
+        echo "=== CONTEXT $(ts_iso) session=$SESSION_ID boot=$CURRENT_BOOT ==="
+        echo "--- KERNEL ---"
+        uname -a
+        echo "cmdline: $(cat /proc/cmdline 2>/dev/null)"
+        echo "tainted: $(cat /proc/sys/kernel/tainted 2>/dev/null)"
+        echo "--- PLATFORM ---"
+        for k in product_name board_name bios_version bios_date; do
+            echo "$k: $(cat "/sys/class/dmi/id/$k" 2>/dev/null)"
+        done
+        echo "model: $(grep -m1 '^model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2-)"
+        echo "microcode: $(grep -m1 '^microcode' /proc/cpuinfo 2>/dev/null | cut -d: -f2-)"
+        echo "memtotal: $(grep -m1 MemTotal /proc/meminfo 2>/dev/null)"
+        echo "--- CPU FREQ POSTURE ---"
+        echo "boost: $(cat /sys/devices/system/cpu/cpufreq/boost 2>/dev/null)"
+        echo "amd_pstate: $(cat /sys/devices/system/cpu/amd_pstate/status 2>/dev/null)"
+        echo "governor: $(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_governor 2>/dev/null)"
+        echo "max_khz: $(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq 2>/dev/null)"
+        echo "--- PANIC POSTURE (sysctl) ---"
+        sysctl kernel.panic kernel.panic_on_oops kernel.softlockup_panic \
+               kernel.hardlockup_panic kernel.hung_task_panic 2>/dev/null
+        echo "--- AMDGPU MODULE PARAMS ---"
+        for p in gpu_recovery lockup_timeout; do
+            echo "$p: $(cat "/sys/module/amdgpu/parameters/$p" 2>/dev/null)"
+        done
+        echo "--- MODULES ---"
+        lsmod 2>/dev/null | head -40
+        echo "=== END CONTEXT ==="
+    } > "$ctx" 2>/dev/null
+    sync_file "$ctx"
+}
+write_context_snapshot
+
 # Check for crashed previous session (handles same-boot and cross-boot)
 CRASHED_SESSION=$(check_crashed_sessions)
 if [ -n "$CRASHED_SESSION" ]; then
@@ -303,6 +358,7 @@ COLLECTORS=(
     "heartbeat:$FD_LIB/collector_heartbeat.sh"
     "fast:$FD_LIB/collector_fast.sh"
     "gpu:$FD_LIB/collector_gpu.sh"
+    "cpu:$FD_LIB/collector_cpu.sh"
     "watchdog:$FD_LIB/collector_watchdog.sh"
     "detailed:$FD_LIB/collector_detailed.sh"
     "dmesg:$FD_LIB/collector_dmesg.sh"
