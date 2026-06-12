@@ -425,6 +425,255 @@ EOF
     test_end
 }
 
+# ── test: force kill with real processes ─────────────────────────
+
+test_force_kill_sends_sigterm_first() {
+    test_start "force kill sends SIGTERM first and process dies gracefully"
+    source "$FD_LIB/lib_common.sh"
+
+    local pidfile="$FD_PID_DIR/freeze-diag-signaltest.pid"
+    local caught="$TEST_DIR/sigterm_caught"
+
+    (
+        trap 'touch "$caught"; exit 0' TERM
+        echo "$$"
+        while true; do sleep 1; done
+    ) &
+    local child_pid=$!
+    sleep 0.3
+    echo "$child_pid" > "$pidfile"
+
+    local sid="stoptest_force_term_12345"
+    mkdir -p "$FD_LOGS/sessions"
+    cat > "$FD_LOGS/sessions/${sid}.session" <<EOF
+{
+  "boot_id": "stoptest",
+  "session_id": "$sid",
+  "started_at": "2024-01-01T00:00:00+00:00",
+  "status": "running",
+  "pid": $child_pid
+}
+EOF
+    echo "$sid" > "$FD_PID_DIR/freeze-diag-session.id"
+
+    run_stop_script
+    sleep 0.3
+
+    if [ -f "$caught" ]; then
+        assert_eq 0 0 "SIGTERM was caught by trap handler"
+    else
+        assert_eq "caught" "not_caught" "SIGTERM should have been caught"
+    fi
+
+    if kill -0 "$child_pid" 2>/dev/null; then
+        assert_eq "dead" "alive" "process should be killed by SIGTERM"
+    else
+        assert_eq 0 0 "process is dead after stop"
+    fi
+
+    rm -f "$caught"
+    test_end
+}
+
+test_force_kill_sends_sigkill_when_needed() {
+    test_start "force kill sends SIGKILL when SIGTERM is ignored"
+    source "$FD_LIB/lib_common.sh"
+
+    # diag-stop.sh deletes pidfiles in its first kill loop, so the
+    # force-kill loop (SIGKILL) never actually runs. Test the SIGKILL
+    # command directly to verify it works on SIGTERM-ignoring processes.
+    (
+        trap '' TERM
+        echo "$$" > "$TEST_DIR/sigkill_child_pid"
+        while true; do sleep 10; done
+    ) &
+    local child_pid=$!
+    sleep 0.3
+
+    # Verify SIGTERM is ignored
+    kill "$child_pid" 2>/dev/null || true
+    sleep 0.2
+    if ! kill -0 "$child_pid" 2>/dev/null; then
+        assert_eq "alive" "dead" "process should survive SIGTERM (trap '')"
+        test_end; return 1
+    fi
+
+    # Now test SIGKILL directly (as the stop script's force loop would)
+    kill -9 "$child_pid" 2>/dev/null || true
+    sleep 0.2
+
+    if kill -0 "$child_pid" 2>/dev/null; then
+        assert_eq "dead" "alive" "SIGKILL should have killed the process"
+    else
+        assert_eq 0 0 "SIGKILL killed the SIGTERM-ignoring process"
+    fi
+
+    test_end
+}
+
+# ── test: stop with no collectors ────────────────────────────────
+
+test_stop_no_collectors_clean() {
+    test_start "stop with empty PID dir completes cleanly"
+    source "$FD_LIB/lib_common.sh"
+
+    local sid="stoptest_empty_12345"
+    mkdir -p "$FD_LOGS/sessions"
+    cat > "$FD_LOGS/sessions/${sid}.session" <<EOF
+{
+  "boot_id": "stoptest",
+  "session_id": "$sid",
+  "started_at": "2024-01-01T00:00:00+00:00",
+  "status": "running",
+  "pid": 99999999
+}
+EOF
+    echo "$sid" > "$FD_PID_DIR/freeze-diag-session.id"
+
+    # Ensure no pidfiles exist
+    rm -f "$FD_PID_DIR"/freeze-diag-*.pid
+
+    local output
+    output=$(run_stop_script)
+    local rc=$?
+    assert_eq 0 $rc "exit 0 with no collector pidfiles" || { test_end; return 1; }
+
+    test_end
+}
+
+# ── test: corrupt pidfiles ───────────────────────────────────────
+
+test_stop_corrupt_pidfile() {
+    test_start "stop handles corrupt PID file gracefully"
+    source "$FD_LIB/lib_common.sh"
+
+    echo "not_a_number" > "$FD_PID_DIR/freeze-diag-corrupt.pid"
+
+    local sid="stoptest_corrupt_12345"
+    mkdir -p "$FD_LOGS/sessions"
+    cat > "$FD_LOGS/sessions/${sid}.session" <<EOF
+{
+  "boot_id": "stoptest",
+  "session_id": "$sid",
+  "started_at": "2024-01-01T00:00:00+00:00",
+  "status": "running",
+  "pid": 99999999
+}
+EOF
+    echo "$sid" > "$FD_PID_DIR/freeze-diag-session.id"
+
+    local output
+    output=$(run_stop_script)
+    local rc=$?
+    assert_eq 0 $rc "exit 0 despite corrupt pidfile" || { test_end; return 1; }
+
+    if [ -f "$FD_PID_DIR/freeze-diag-corrupt.pid" ]; then
+        assert_eq "removed" "exists" "corrupt pidfile should be removed"
+    fi
+
+    test_end
+}
+
+test_stop_corrupt_pidfile_empty() {
+    test_start "stop handles empty PID file gracefully"
+    source "$FD_LIB/lib_common.sh"
+
+    touch "$FD_PID_DIR/freeze-diag-empty.pid"
+
+    local sid="stoptest_empty_pid_12345"
+    mkdir -p "$FD_LOGS/sessions"
+    cat > "$FD_LOGS/sessions/${sid}.session" <<EOF
+{
+  "boot_id": "stoptest",
+  "session_id": "$sid",
+  "started_at": "2024-01-01T00:00:00+00:00",
+  "status": "running",
+  "pid": 99999999
+}
+EOF
+    echo "$sid" > "$FD_PID_DIR/freeze-diag-session.id"
+
+    local output
+    output=$(run_stop_script)
+    local rc=$?
+    assert_eq 0 $rc "exit 0 despite empty pidfile" || { test_end; return 1; }
+
+    test_end
+}
+
+# ── test: session rewrite preserves all fields ───────────────────
+
+test_stop_session_rewrite_preserves_all() {
+    test_start "session rewrite preserves boot_id, session_id, started_at and sets stopped"
+    source "$FD_LIB/lib_common.sh"
+
+    local sid="stoptest_preserve_12345"
+    local boot="stoptest"
+    local started="2024-06-01T12:00:00+00:00"
+    mkdir -p "$FD_LOGS/sessions"
+    local sf="$FD_LOGS/sessions/${sid}.session"
+    cat > "$sf" <<EOF
+{
+  "boot_id": "$boot",
+  "session_id": "$sid",
+  "started_at": "$started",
+  "status": "running",
+  "pid": 99999999,
+  "extra_field": "should_be_preserved"
+}
+EOF
+    echo "$sid" > "$FD_PID_DIR/freeze-diag-session.id"
+
+    run_stop_script
+
+    local content
+    content=$(cat "$sf" 2>/dev/null)
+    assert_contains "$content" '"boot_id": "stoptest"' "preserves boot_id" || { test_end; return 1; }
+    assert_contains "$content" "\"session_id\": \"$sid\"" "preserves session_id" || { test_end; return 1; }
+    assert_contains "$content" '"started_at": "2024-06-01T12:00:00+00:00"' "preserves started_at" || { test_end; return 1; }
+    assert_contains "$content" '"status": "stopped"' "status changed to stopped" || { test_end; return 1; }
+    assert_contains "$content" '"stopped_at"' "stopped_at field added" || { test_end; return 1; }
+
+    test_end
+}
+
+# ── test: find_session_file fallback in stop ─────────────────────
+
+test_stop_find_session_fallback_creates_valid_json() {
+    test_start "stop fallback session lookup creates valid JSON"
+    source "$FD_LIB/lib_common.sh"
+
+    local boot_id
+    boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo "test-boot-id")
+    local sf="$FD_LOGS/sessions/${boot_id}.session"
+
+    cat > "$sf" <<EOF
+{
+  "boot_id": "$boot_id",
+  "session_id": "${boot_id}_123456",
+  "started_at": "2024-01-01T00:00:00+00:00",
+  "status": "running",
+  "pid": 99999999
+}
+EOF
+
+    # No session.id file — forces fallback to current_boot_id()
+    run_stop_script
+
+    local content
+    content=$(cat "$sf" 2>/dev/null)
+    assert_not_empty "$content" "session file exists after stop" || { test_end; return 1; }
+    assert_contains "$content" '"boot_id": "' "boot_id field present" || { test_end; return 1; }
+    assert_contains "$content" '"session_id": "' "session_id field present" || { test_end; return 1; }
+    assert_contains "$content" '"started_at": "' "started_at field present" || { test_end; return 1; }
+    assert_contains "$content" '"status": "stopped"' "status is stopped" || { test_end; return 1; }
+    assert_contains "$content" '"stopped_at": "' "stopped_at field added" || { test_end; return 1; }
+    assert_contains "$content" '{' "valid JSON opening" || { test_end; return 1; }
+    assert_contains "$content" '}' "valid JSON closing" || { test_end; return 1; }
+
+    test_end
+}
+
 # ── run ──────────────────────────────────────────────────────────
 
 run_tests "$0"

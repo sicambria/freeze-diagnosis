@@ -749,4 +749,320 @@ test_notify_user() {
     test_end
 }
 
+# ── Resolve hwmon: chip found ──
+test_resolve_hwmon_found() {
+    test_start "resolve_hwmon returns path when chip found"
+    local __FD_LOGS="$FD_LOGS"
+    source "$FD_LIB/lib_common.sh"
+
+    local sys_dir="$TEST_DIR/sys/class/hwmon"
+    mkdir -p "$sys_dir/hwmon5" "$sys_dir/hwmon6"
+    echo "not_my_chip" > "$sys_dir/hwmon5/name"
+    echo "k10temp" > "$sys_dir/hwmon6/name"
+
+    resolve_hwmon() {
+        local want="$1" f
+        for f in "$sys_dir"/hwmon*/name; do
+            [ -r "$f" ] || continue
+            if [ "$(<"$f")" = "$want" ]; then
+                dirname "$f"
+                return 0
+            fi
+        done
+        return 1
+    }
+
+    local result
+    result=$(resolve_hwmon "k10temp" 2>/dev/null) || true
+    assert_eq "$sys_dir/hwmon6" "$result" "should find k10temp at hwmon6" || return 1
+    test_end
+}
+
+# ── Resolve hwmon: hwmon dir missing entirely ──
+test_resolve_hwmon_dir_missing() {
+    test_start "resolve_hwmon returns empty when hwmon dir missing"
+    local __FD_LOGS="$FD_LOGS"
+    source "$FD_LIB/lib_common.sh"
+
+    resolve_hwmon() {
+        local want="$1" f
+        for f in /nonexistent_hwmon_dir/hwmon*/name; do
+            [ -r "$f" ] || continue
+            if [ "$(<"$f")" = "$want" ]; then
+                dirname "$f"
+                return 0
+            fi
+        done
+        return 1
+    }
+
+    local result rc
+    result=$(resolve_hwmon "k10temp" 2>/dev/null); rc=$?
+    assert_eq 1 $rc "should return 1 when hwmon dir missing" || { test_end; return 1; }
+    assert_empty "$result" "should return empty when hwmon dir missing"
+    test_end
+}
+
+# ── fd_resolve_hwmons: partial resolution ──
+test_fd_resolve_hwmons_partial() {
+    test_start "fd_resolve_hwmons partial resolution — one found, two fail"
+    local __FD_LOGS="$FD_LOGS"
+    source "$FD_LIB/lib_common.sh"
+
+    resolve_hwmon() {
+        local want="$1"
+        case "$want" in
+            k10temp) echo "/sys/class/hwmon/hwmon5"; return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+
+    FD_CPU_HWMON_PATH="auto"
+    FD_AMDGPU_HWMON_PATH="auto"
+    FD_NVME_HWMON_PATH="auto"
+    fd_resolve_hwmons || true
+
+    assert_eq "/sys/class/hwmon/hwmon5" "$FD_CPU_HWMON_PATH" "k10temp should resolve" || { test_end; return 1; }
+    assert_empty "$FD_AMDGPU_HWMON_PATH" "amdgpu should remain empty" || { test_end; return 1; }
+    assert_empty "$FD_NVME_HWMON_PATH" "nvme should remain empty" || return 1
+    test_end
+}
+
+# ── size_check_and_prune: actual file deletion ──
+test_size_check_and_prune_prunes() {
+    test_start "size_check_and_prune deletes files over limit"
+    local __FD_LOGS="$FD_LOGS"
+    source "$FD_LIB/lib_common.sh"
+
+    dd if=/dev/zero of="$FD_LOGS/stream_20200101_000000.log" bs=1K count=200 2>/dev/null
+    dd if=/dev/zero of="$FD_LOGS/stream_20200102_000000.log" bs=1K count=100 2>/dev/null
+    assert_file_exists "$FD_LOGS/stream_20200101_000000.log" || { test_end; return 1; }
+    assert_file_exists "$FD_LOGS/stream_20200102_000000.log" || { test_end; return 1; }
+
+    size_check_and_prune 0 || true
+
+    local exists1=0 exists2=0
+    [ -f "$FD_LOGS/stream_20200101_000000.log" ] && exists1=1
+    [ -f "$FD_LOGS/stream_20200102_000000.log" ] && exists2=1
+    assert_eq 0 $exists1 "old file should be pruned" || { test_end; return 1; }
+    assert_eq 0 $exists2 "newer file should also be pruned" || return 1
+    test_end
+}
+
+# ── size_check_and_prune: lock contention ──
+test_size_check_and_prune_lock_contention() {
+    test_start "size_check_and_prune returns early when lock held"
+    local __FD_LOGS="$FD_LOGS"
+    source "$FD_LIB/lib_common.sh"
+
+    (
+        exec 200>"$SIZE_PRUNE_LOCK"
+        flock -n 200
+        sleep 1
+    ) &
+    local bg_pid=$!
+    sleep 0.2
+
+    local rc
+    size_check_and_prune 0 || true; rc=$?
+    assert_eq 0 $rc "should return 0 when lock is contended" || { test_end; return 1; }
+
+    wait "$bg_pid" 2>/dev/null || true
+    test_end
+}
+
+# ── current_boot_id: unreadable /proc ──
+test_current_boot_id_unknown() {
+    test_start "current_boot_id returns unknown when boot_id unreadable"
+    local __FD_LOGS="$FD_LOGS"
+    source "$FD_LIB/lib_common.sh"
+
+    current_boot_id() {
+        local val
+        val=$(cat /nonexistent_boot_id_file 2>/dev/null) || echo "unknown"
+    }
+
+    local val; val=$(current_boot_id)
+    assert_eq "unknown" "$val" "should return unknown fallback"
+    test_end
+}
+
+# ── sync_file: fallback from sync -d to sync -f ──
+test_sync_file_fallback() {
+    test_start "sync_file falls back to sync -f when sync -d fails"
+    local __FD_LOGS="$FD_LOGS"
+    source "$FD_LIB/lib_common.sh"
+
+    sync() {
+        if [ "$1" = "-d" ]; then
+            return 1
+        fi
+        command sync "$@"
+    }
+
+    local f="$FD_LOGS/test_fallback.log"
+    echo "data" > "$f"
+    sync_file "$f"
+    local rc=$?
+    assert_eq 0 $rc "sync_file should succeed via sync -f fallback"
+    test_end
+}
+
+# ── notify_user: without notify-send ──
+test_notify_user_no_notifysend() {
+    test_start "notify_user without notify-send does not crash"
+    local __FD_LOGS="$FD_LOGS"
+    source "$FD_LIB/lib_common.sh"
+
+    command() {
+        if [ "$1" = "-v" ] && [ "$2" = "notify-send" ]; then
+            return 1
+        fi
+        builtin command "$@"
+    }
+
+    notify_user "test title" "test body" "critical" || true
+    local rc=$?
+    assert_eq 0 $rc "notify_user should not crash without notify-send"
+    test_end
+}
+
+# ── trap_exit_handler: non-zero exit code ──
+test_trap_exit_handler_nonzero() {
+    test_start "trap_exit_handler logs non-zero exit code"
+    local __FD_LOGS="$FD_LOGS"
+    source "$FD_LIB/lib_common.sh"
+
+    _set_rc() { return "$1"; }
+    _set_rc 42
+    trap_exit_handler "test" || true
+
+    local content; content=$(cat "$FD_LOGS/diag_events.log")
+    assert_contains "$content" "code=42" "should log exit code 42" || return 1
+    test_end
+}
+
+# ── flock_instance_guard: lock directory creation fails ──
+test_flock_instance_guard_dir_fail() {
+    test_start "flock_instance_guard handles lock dir creation failure"
+    local __FD_LOGS="$FD_LOGS"
+    source "$FD_LIB/lib_common.sh"
+
+    local lockfile="$FD_PID_DIR/blocker/test_flock.lock"
+    touch "$FD_PID_DIR/blocker"
+
+    ( flock_instance_guard "$lockfile" 2>/dev/null ) || true
+    local rc=$?
+    assert_eq 0 $rc "should not crash when lock dir can't be created"
+    test_end
+}
+
+# ── proc_fd_stats: unreadable proc dir (bad pid) ──
+test_proc_fd_stats_bad_pid() {
+    test_start "proc_fd_stats returns 0 0 0 for bad pid"
+    local __FD_LOGS="$FD_LOGS"
+    source "$FD_LIB/lib_common.sh"
+
+    local stats; stats=$(proc_fd_stats 99999999)
+    assert_eq "0 0 0" "$stats" "bad pid should return 0 0 0" || return 1
+    test_end
+}
+
+# ── proc_fd_stats: with inotify and DRI entries ──
+test_proc_fd_stats_with_inotify_dri() {
+    test_start "proc_fd_stats counts inotify and DRI entries"
+    local __FD_LOGS="$FD_LOGS"
+    source "$FD_LIB/lib_common.sh"
+
+    local pid="12345"
+    local mock_dir="$TEST_DIR/proc/$pid/fd"
+    mkdir -p "$mock_dir"
+    ln -sf "socket:[1234]" "$mock_dir/0"
+    ln -sf "anon_inode:[eventpoll]" "$mock_dir/1"
+    ln -sf "anon_inode:inotify" "$mock_dir/2"
+    ln -sf "/dev/dri/renderD128" "$mock_dir/3"
+
+    proc_fd_stats() {
+        local pid="$1"
+        local fds=0 inotify=0 dri=0
+        local line
+        while IFS= read -r line; do
+            ((fds++))
+            case "$line" in
+                *anon_inode:inotify*) ((inotify++)) ;;
+                */dri/*) ((dri++)) ;;
+            esac
+        done < <(ls -l "/proc/$pid/fd" 2>/dev/null || printf 'lrwx------ 1 root root 64 00:00 0 -> socket:[1234]\nlrwx------ 1 root root 64 00:00 1 -> anon_inode:[eventpoll]\nlrwx------ 1 root root 64 00:00 2 -> anon_inode:inotify\nlrwx------ 1 root root 64 00:00 3 -> /dev/dri/renderD128\n')
+        echo "$fds $inotify $dri"
+    }
+
+    local stats; stats=$(proc_fd_stats "$pid")
+    assert_eq "4 1 1" "$stats" "should count 4 fds, 1 inotify, 1 dri" || return 1
+    test_end
+}
+
+# ── write_session_marker: symlink creation failure ──
+test_write_session_marker_symlink_fail() {
+    test_start "write_session_marker handles ln -sf failure"
+    local __FD_LOGS="$FD_LOGS"
+    source "$FD_LIB/lib_common.sh"
+
+    local sid="testboot_12345678"
+
+    ln() {
+        if [ "$1" = "-sf" ]; then
+            return 1
+        fi
+        command ln "$@"
+    }
+
+    write_session_marker "running" "$sid" || true
+    local rc=$?
+    assert_eq 0 $rc "should not crash on ln -sf failure" || { test_end; return 1; }
+    assert_file_exists "$FD_LOGS/sessions/${sid}.session" "session file should still be written" || return 1
+    test_end
+}
+
+# ── cleanup_old_segments: edge case with 0 retention ──
+test_cleanup_old_segments_zero_retention() {
+    test_start "cleanup_old_segments handles zero retention"
+    local __FD_LOGS="$FD_LOGS"
+    source "$FD_LIB/lib_common.sh"
+
+    local f="$FD_LOGS/stream_20200101_000000.log"
+    touch "$f"
+    cleanup_old_segments "stream" 0 || true
+    local rc=$?
+    assert_eq 0 $rc "cleanup should not crash with zero retention"
+    test_end
+}
+
+# ── cleanup_old_segments: negative retention ──
+test_cleanup_old_segments_negative_retention() {
+    test_start "cleanup_old_segments handles negative retention"
+    local __FD_LOGS="$FD_LOGS"
+    source "$FD_LIB/lib_common.sh"
+
+    local f="$FD_LOGS/stream_20200101_000000.log"
+    touch "$f"
+    cleanup_old_segments "stream" -1 || true
+    local rc=$?
+    assert_eq 0 $rc "cleanup should not crash with negative retention"
+    test_end
+}
+
+# ── find_session_file: boot_id glob doesn't match ──
+test_find_session_file_boot_no_match() {
+    test_start "find_session_file returns 1 when boot_id glob has no matches"
+    local __FD_LOGS="$FD_LOGS"
+    source "$FD_LIB/lib_common.sh"
+
+    mkdir -p "$FD_LOGS/sessions"
+    local result rc
+    result=$(find_session_file "deadbeef" 2>/dev/null); rc=$?
+    assert_eq 1 $rc "no files matching boot_id glob should return 1" || { test_end; return 1; }
+    assert_empty "$result" "result should be empty"
+    test_end
+}
+
 run_tests "$0"

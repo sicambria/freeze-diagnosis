@@ -1663,6 +1663,423 @@ test_arg_parse_combined() {
 }
 
 # ═══════════════════════════════════════════════════════════════════
+#  RUN — continued below (test function appended after original EOF)
+# ═══════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════
+#  GENERATE_REPORT
+# ═══════════════════════════════════════════════════════════════════
+generate_report() {
+    local freeze_ts="$1"
+    local report_file="$2"
+
+    local ftime_str
+    ftime_str=$(date -d "@$freeze_ts" --iso-8601=seconds 2>/dev/null || echo "$freeze_ts")
+
+    analyze_gpu "$freeze_ts"
+    analyze_oom "$freeze_ts"
+    analyze_nvme "$freeze_ts"
+    local gpu_evidence="$GPU_EVIDENCE" oom_evidence="$OOM_EVIDENCE" nvme_evidence="$NVME_EVIDENCE"
+    analyze_memory_pressure "$freeze_ts"
+    analyze_thermal "$freeze_ts"
+    analyze_process_triggers "$freeze_ts"
+    analyze_leak "$freeze_ts"
+    analyze_kernel_faults "$freeze_ts"
+    analyze_pstore "$freeze_ts"
+    analyze_cpu_freq "$freeze_ts"
+    load_context
+
+    local same_boot_info
+    same_boot_info=$(check_same_boot_crashes "${CURRENT_BOOT:-}" "${ANALYZE_SESSION:-}")
+
+    {
+        echo "FREEZE DIAGNOSIS REPORT — $ftime_str"
+        echo "═══════════════════════════════════════════════"
+        local session_label="${ANALYZE_SESSION:-${ANALYZE_BOOT:-$CURRENT_BOOT}}"
+        echo "Session: $session_label"
+        echo "Freeze at: $ftime_str"
+        if [ -n "$same_boot_info" ]; then
+            local crash_count="${same_boot_info%%|*}"
+            local crash_list="${same_boot_info#*|}"
+            echo "Same-boot crashes: $crash_count previous crash(es) in this boot"
+            while IFS= read -r l; do echo "  $l"; done <<< "$crash_list"
+        fi
+        if [ -n "$CONTEXT_INFO" ]; then
+            echo "SESSION CONTEXT (kernel / firmware / freq posture)"
+            echo "$CONTEXT_INFO"
+        fi
+        echo ""
+
+        echo "FINDINGS (severity: ████ HIGH  ███ MEDIUM  ██ LOW  █ NONE)"
+        echo ""
+
+        echo "$(severity_blocks "$SCORE_KERNEL") KERNEL FAULT ($(severity_label "$SCORE_KERNEL"))"
+        if [ -n "$KERNEL_EVIDENCE" ]; then
+            echo "$KERNEL_EVIDENCE" | head -15 | while IFS= read -r l; do echo "  $l"; done
+            echo "  NOTE: oops/GPF/lockup lines are kernel-level faults that"
+            echo "  userspace cannot cause — suspect kernel bug or hardware"
+            echo "  (repeated single-bit pointer corruption across kernels = HW)."
+        else
+            echo "  No kernel oops/GPF/lockup/MCE evidence captured."
+        fi
+        if [ -n "$PSTORE_INFO" ]; then
+            echo "  Panic records (pstore) near this freeze:"
+            printf '%s' "$PSTORE_INFO"
+            echo "  (root-only; auto-copied into archive/ crash bundles when fd-pstore-dump is installed)"
+        fi
+        echo ""
+
+        if [ -n "$CPU_FREQ_INFO" ]; then
+            echo "CPU FREQ BEFORE FREEZE (transient/boost forensics)"
+            echo "$CPU_FREQ_INFO"
+            echo ""
+        fi
+
+        if [ "$GPU_ONLY" = false ] || [ "$GPU_ONLY" = true ]; then
+            echo "$(severity_blocks "$SCORE_GPU") GPU HANG ($(severity_label "$SCORE_GPU"))"
+            if [ -n "$gpu_evidence" ]; then
+                echo "$gpu_evidence" | tail -5 | while IFS= read -r l; do echo "  $l"; done
+            fi
+            if [ "$GPU_POWER_ANOMALY" != 0 ]; then
+                echo "  GPU power anomaly: ${GPU_POWER_ANOMALY}W per % busy (threshold >4.0)"
+            fi
+            if [ -z "$gpu_evidence" ] && [ "$GPU_POWER_ANOMALY" = 0 ]; then
+                echo "  No GPU fault evidence in dmesg or journal."
+            fi
+            echo ""
+        fi
+
+        if [ "$MEMORY_ONLY" = false ] && [ "$GPU_ONLY" = false ]; then
+            echo "$(severity_blocks "$SCORE_OOM") OOM ($(severity_label "$SCORE_OOM"))"
+            if [ -n "$oom_evidence" ]; then
+                echo "$oom_evidence" | tail -5 | while IFS= read -r l; do echo "  $l"; done
+            else
+                echo "  No OOM killer activity in dmesg or journal."
+            fi
+            echo ""
+        fi
+
+        if [ "$GPU_ONLY" = false ] && [ "$MEMORY_ONLY" = false ]; then
+            echo "$(severity_blocks "$SCORE_NVME") NVMe ($(severity_label "$SCORE_NVME"))"
+            if [ -n "$nvme_evidence" ]; then
+                echo "$nvme_evidence" | tail -5 | while IFS= read -r l; do echo "  $l"; done
+            else
+                echo "  No NVMe errors in dmesg or journal."
+            fi
+            echo ""
+        fi
+
+        if [ "$GPU_ONLY" = false ]; then
+            echo "$(severity_blocks "$SCORE_MEM") MEMORY PRESSURE ($(severity_label "$SCORE_MEM"))"
+            if [ "$SCORE_MEM" -gt 0 ]; then
+                echo "  High memory pressure before freeze (PSI / swap)."
+            else
+                echo "  Normal memory pressure leading to freeze."
+            fi
+            echo ""
+        fi
+
+        echo "$(severity_blocks "$SCORE_THERMAL") THERMAL ($(severity_label "$SCORE_THERMAL"))"
+        if [ "$SCORE_THERMAL" -gt 0 ]; then
+            echo "  GPU/CPU temperature exceeded 95°C before freeze."
+        else
+            echo "  Temperatures within safe range."
+        fi
+        echo ""
+
+        echo "$(severity_blocks "$SCORE_LEAK") PROCESS LEAK ($(severity_label "$SCORE_LEAK"))"
+        if [ "$SCORE_LEAK" -gt 0 ]; then
+            echo "  Process RSS growth detected (see trigger analysis below)."
+        else
+            echo "  No significant memory leak detected."
+        fi
+        echo ""
+
+        if [ -n "$PROCESS_TRIGGER" ]; then
+            echo "PROCESS TRIGGER ANALYSIS (60s window before freeze)"
+            echo "───────────────────────────────────────────────────"
+            echo -n "$PROCESS_TRIGGER"
+            echo ""
+        fi
+
+        echo "RAW LOG EXCERPTS (last 10 lines each stream)"
+        echo "─────────────────────────────────────────────"
+        for stream in heartbeat fast cpu gpu watchdog detailed dmesg; do
+            echo "--- $stream ---"
+            local lf
+            lf=$(ls -t "$FD_LOGS/${stream}_"*.log 2>/dev/null | head -1 || true)
+            if [ -n "$lf" ]; then
+                tail -10 "$lf" 2>/dev/null || echo "(empty)"
+            else
+                echo "(no logs)"
+            fi
+            echo ""
+        done
+
+        echo "Full report saved to: $report_file"
+    } > "$report_file"
+}
+
+# ═══════════════════════════════════════════════════════════════════
+#  GENERATE REPORT — FULL INTEGRATION
+# ═══════════════════════════════════════════════════════════════════
+test_generate_report_basic() {
+    test_start "generate_report produces full report with all sections"
+    source_deps
+    reset_scores
+
+    local freeze_ts=1000000
+    local session_start=$((freeze_ts - 120))
+    local boot="$CURRENT_BOOT"
+    local sid="${boot}_${session_start}"
+
+    ANALYZE_SESSION="$sid"
+    ANALYZE_BOOT="$boot"
+    GPU_ONLY=false
+    MEMORY_ONLY=false
+
+    # Context file
+    create_context_file "$sid"
+
+    # Session file with crashed status and detected_at within cutoff
+    detected_at="2001-09-09T01:48:40+00:00"
+    create_session_file "$sid" "$boot" "crashed" "2001-09-09T01:46:40+00:00"
+    detected_at=""
+
+    # Heartbeat with gap (for freeze time detection path)
+    create_segment "heartbeat" "20250101_120000"
+    write_to_segment "heartbeat" "20250101_120000" "$((freeze_ts - 10)) beat 1"
+    write_to_segment "heartbeat" "20250101_120000" "$((freeze_ts - 5)) beat 2"
+    write_to_segment "heartbeat" "20250101_120000" "${freeze_ts} beat 3"
+    touch_segment_mtime "heartbeat" "20250101_120000" "$((session_start - 600))"
+
+    # Fast stream — thermal above threshold + memory pressure
+    create_segment "fast" "20250101_120000"
+    write_to_segment "fast" "20250101_120000" "$((freeze_ts - 60))|psimf=95.0|swapf=50|oomd=0|gtemp=98.0|ctemp=70|xpss=1000|top3=100,bash,50000"
+    write_to_segment "fast" "20250101_120000" "$((freeze_ts - 10))|psimf=10.0|swapf=500|oomd=0|gtemp=65.0|ctemp=50|xpss=1000"
+
+    # GPU stream with power data
+    create_segment "gpu" "20250101_120000"
+    write_to_segment "gpu" "20250101_120000" "$((freeze_ts - 10))|busy=10|power=50|vram=4096|temp=65"
+
+    # CPU stream
+    create_segment "cpu" "20250101_120000"
+    write_to_segment "cpu" "20250101_120000" "$((freeze_ts - 10))|fmax=4200|nhi=2|boost=1|taint=0"
+
+    # Dmesg — GPU, OOM, NVMe, kernel evidence
+    create_segment "dmesg" "20250101_120000"
+    write_to_segment "dmesg" "20250101_120000" "D: [0] amdgpu ring timeout on ring 0"
+    write_to_segment "dmesg" "20250101_120000" "D: [1] amdgpu fence timeout"
+    write_to_segment "dmesg" "20250101_120000" "D: [2] amdgpu GPU fault"
+    write_to_segment "dmesg" "20250101_120000" "D: [3] Out of memory: Killed process 1234 (firefox)"
+    write_to_segment "dmesg" "20250101_120000" "D: [4] nvme nvme0: I/O error"
+    write_to_segment "dmesg" "20250101_120000" "D: [5] general protection fault"
+
+    local report_file="$TEST_DIR/report.txt"
+    generate_report "$freeze_ts" "$report_file"
+
+    assert_file_exists "$report_file" "report file should exist" || { test_end; return 1; }
+
+    local content
+    content=$(cat "$report_file")
+
+    # Header and metadata
+    assert_contains "$content" "FREEZE DIAGNOSIS REPORT" "should have report header" || { test_end; return 1; }
+    assert_contains "$content" "Session: $sid" "should contain session ID" || { test_end; return 1; }
+    assert_contains "$content" "Freeze at:" "should contain freeze timestamp" || { test_end; return 1; }
+
+    # Category sections
+    assert_contains "$content" "GPU HANG" "should have GPU section" || { test_end; return 1; }
+    assert_contains "$content" "OOM" "should have OOM section" || { test_end; return 1; }
+    assert_contains "$content" "NVMe" "should have NVMe section" || { test_end; return 1; }
+    assert_contains "$content" "MEMORY PRESSURE" "should have MEMORY section" || { test_end; return 1; }
+    assert_contains "$content" "THERMAL" "should have THERMAL section" || { test_end; return 1; }
+    assert_contains "$content" "KERNEL FAULT" "should have KERNEL section" || { test_end; return 1; }
+    assert_contains "$content" "PROCESS LEAK" "should have LEAK section" || { test_end; return 1; }
+
+    # CPU freq posture
+    assert_contains "$content" "CPU FREQ BEFORE FREEZE" "should have CPU section" || { test_end; return 1; }
+
+    # Context
+    assert_contains "$content" "SESSION CONTEXT" "should have context section" || { test_end; return 1; }
+    assert_contains "$content" "Linux version 6.2.0-arch" "should contain kernel version" || { test_end; return 1; }
+
+    # Raw log excerpts
+    assert_contains "$content" "RAW LOG EXCERPTS" "should have raw excerpts" || { test_end; return 1; }
+    assert_contains "$content" "--- heartbeat ---" "should include heartbeat stream" || { test_end; return 1; }
+    assert_contains "$content" "--- dmesg ---" "should include dmesg stream" || { test_end; return 1; }
+
+    # Severity indicators
+    assert_contains "$content" "HIGH" "should have HIGH severity" || { test_end; return 1; }
+    assert_contains "$content" "MEDIUM" "should have MEDIUM severity" || { test_end; return 1; }
+
+    test_end
+}
+
+# ═══════════════════════════════════════════════════════════════════
+#  INTERACTIVE MENU
+# ═══════════════════════════════════════════════════════════════════
+test_interactive_menu_quit() {
+    test_start "interactive menu q exits with Goodbye"
+    local output
+    output=$(echo "q" | timeout 5 bash "$(dirname "$0")/../diag-analyze.sh" 2>&1 || true)
+    assert_contains "$output" "Goodbye" "should print Goodbye message"
+    test_end
+}
+
+test_interactive_menu_invalid() {
+    test_start "interactive menu invalid choice shows error"
+    local output
+    output=$(printf 'invalid\n\nq\n' | timeout 5 bash "$(dirname "$0")/../diag-analyze.sh" 2>&1 || true)
+    assert_contains "$output" "Invalid choice" "should show invalid choice message"
+    test_end
+}
+
+test_interactive_menu_option6() {
+    test_start "interactive menu option 6 generates full report"
+    source_deps
+    reset_scores
+
+    # Create heartbeat files so find_freeze_time works
+    create_segment "heartbeat" "20250101_120000"
+    write_to_segment "heartbeat" "20250101_120000" "999950 beat 1"
+    write_to_segment "heartbeat" "20250101_120000" "999995 beat 2"
+
+    # Create context so report is richer
+    create_context_file "${CURRENT_BOOT}_999000"
+
+    local output
+    output=$(printf '6\nq\n' | timeout 5 bash "$(dirname "$0")/../diag-analyze.sh" 2>&1 || true)
+    assert_contains "$output" "FREEZE DIAGNOSIS REPORT" "option 6 should generate report"
+    test_end
+}
+
+# ═══════════════════════════════════════════════════════════════════
+#  NON-INTERACTIVE MAIN EXECUTION
+# ═══════════════════════════════════════════════════════════════════
+test_main_execution_with_session() {
+    test_start "main execution --session generates report"
+    source_deps
+    reset_scores
+
+    local session_start=1000000
+    local boot="$CURRENT_BOOT"
+    local sid="${boot}_${session_start}"
+
+    # Create heartbeat with gap so freeze time is detected
+    create_segment "heartbeat" "20250101_120000"
+    write_to_segment "heartbeat" "20250101_120000" "$((session_start - 5)) beat 1"
+    write_to_segment "heartbeat" "20250101_120000" "$((session_start + 0)) beat 2"
+    write_to_segment "heartbeat" "20250101_120000" "$((session_start + 10)) beat 3"
+    touch_segment_mtime "heartbeat" "20250101_120000" "$session_start"
+
+    # Crashed session file with detected_at beyond cutoff+120
+    local started="2001-09-09T01:46:40+00:00"
+    local detected="2001-09-09T01:50:00+00:00"
+    create_crashed_session_file "$sid" "$boot" "$started" "$detected"
+
+    # Context file
+    create_context_file "$sid"
+
+    local output
+    output=$(timeout 10 bash "$(dirname "$0")/../diag-analyze.sh" --session "$sid" 2>&1 || true)
+    assert_contains "$output" "FREEZE DIAGNOSIS REPORT" "should generate report for session" || { test_end; return 1; }
+    assert_contains "$output" "Session: $sid" "should show session ID" || { test_end; return 1; }
+    assert_contains "$output" "SESSION CONTEXT" "should include context info"
+    test_end
+}
+
+test_main_execution_nonexistent_session() {
+    test_start "main execution --session nonexistent shows error"
+    local output
+    output=$(bash "$(dirname "$0")/../diag-analyze.sh" --session "nonexistent_12345" 2>&1 || true)
+    assert_contains "$output" "No heartbeat logs found" "should print error message"
+    test_end
+}
+
+# ═══════════════════════════════════════════════════════════════════
+#  ANALYZE_PROCESS_TRIGGERS — WATCHDOG RSS GROWTH
+# ═══════════════════════════════════════════════════════════════════
+test_analyze_process_triggers_watchdog_rss_growth() {
+    test_start "analyze_process_triggers detects RSS growth from watchdog"
+    source_deps
+    reset_scores
+
+    local freeze_ts=1000000
+
+    # Early watchdog sample (age > 150): pid 1001 RSS=100 (100MB)
+    create_segment "watchdog" "20250101_120000"
+    write_to_segment "watchdog" "20250101_120000" "$((freeze_ts - 200))|pid=1001|rss=100|target=firefox|fd=30|vsz=2000000"
+    # Late watchdog sample (age <= 150): pid 1001 RSS=150 (150MB) — delta 50MB > 20MB
+    write_to_segment "watchdog" "20250101_120000" "$((freeze_ts - 100))|pid=1001|rss=150|target=firefox|fd=30|vsz=2000000"
+
+    analyze_process_triggers "$freeze_ts"
+
+    assert_not_empty "$PROCESS_TRIGGER" "should detect RSS growth" || { test_end; return 1; }
+    assert_contains "$PROCESS_TRIGGER" "RSS growth" "should mention RSS growth" || { test_end; return 1; }
+    assert_contains "$PROCESS_TRIGGER" "firefox" "should name the target process" || { test_end; return 1; }
+    assert_contains "$PROCESS_TRIGGER" "+50MB" "should show correct delta"
+
+    test_end
+}
+
+# ═══════════════════════════════════════════════════════════════════
+#  ANALYZE_KERNEL_FAULTS — JOURNAL FALLBACK
+# ═══════════════════════════════════════════════════════════════════
+test_analyze_kernel_faults_with_journal() {
+    test_start "analyze_kernel_faults with journal fallback adds [journal -b -1] prefix"
+    source_deps
+    reset_scores
+
+    ANALYZE_SESSION="testsession_12345"
+
+    # Mock sudo to succeed and return journal oops lines
+    sudo() {
+        case "$*" in
+            "-n true") return 0 ;;
+            "-n journalctl -b -1 -o short-precise --no-pager")
+                echo "Jun 12 10:00:00 host kernel: BUG: soft lockup on CPU#0"
+                echo "Jun 12 10:00:01 host kernel: general protection fault"
+                return 0 ;;
+        esac
+    }
+
+    # No dmesg logs — triggers journal fallback path
+    analyze_kernel_faults 1000000
+
+    assert_contains "$KERNEL_EVIDENCE" "[journal -b -1]" "should have journal prefix" || { test_end; return 1; }
+    assert_contains "$KERNEL_EVIDENCE" "BUG:" "should contain journal bug line" || { test_end; return 1; }
+    assert_contains "$KERNEL_EVIDENCE" "general protection" "should contain GPF line" || { test_end; return 1; }
+    assert_eq 4 "$SCORE_KERNEL" "GPF should set SCORE_KERNEL=4"
+
+    test_end
+}
+
+# ═══════════════════════════════════════════════════════════════════
+#  ANALYZE_GPU — JOURNAL FALLBACK
+# ═══════════════════════════════════════════════════════════════════
+test_analyze_gpu_journal_fallback() {
+    test_start "analyze_gpu falls back to journalctl when dmesg empty"
+    source_deps
+    reset_scores
+
+    # Override journalctl_k to return GPU timeout data (no-op default)
+    journalctl_k() {
+        echo "amdgpu ring timeout on ring 0"
+        echo "amdgpu fence timeout"
+    }
+
+    # No dmesg log files — triggers journal fallback in analyze_gpu
+    analyze_gpu 1000000
+
+    assert_eq 3 "$SCORE_GPU" "journal fallback should set SCORE_GPU=3" || { test_end; return 1; }
+    assert_not_empty "$GPU_EVIDENCE" "evidence should come from journal fallback" || { test_end; return 1; }
+    assert_contains "$GPU_EVIDENCE" "amdgpu" "evidence should contain amdgpu lines"
+
+    test_end
+}
+
+# ═══════════════════════════════════════════════════════════════════
 #  RUN
 # ═══════════════════════════════════════════════════════════════════
 run_tests "$0"

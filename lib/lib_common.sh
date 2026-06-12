@@ -215,8 +215,8 @@ cleanup_pidfile() {
 
 # ---- Trap helper: log exit reason ----
 trap_exit_handler() {
-    local stream="$1"
     local exit_code=$?
+    local stream="$1"
     echo "[$(ts_iso)] $stream collector exiting (code=$exit_code)" >> "$FD_LOGS/diag_events.log" 2>/dev/null
 }
 

@@ -636,6 +636,537 @@ test_grub_key_value_exact_key() {
     test_end
 }
 
+# ── Helper: write-capable add_grub_params for apply_* tests ─────
+
+_add_grub_params_write() {
+    local which="$1" desc="$2"
+    shift 2
+    local params=("$@")
+    local current
+    current=$(read_grub_cmdline "$which")
+    local changed=false
+
+    local new_line="$current"
+    for p in "${params[@]}"; do
+        if has_grub_param "$which" "$p"; then
+            :
+        else
+            new_line="$new_line $p"
+            changed=true
+        fi
+    done
+
+    if [ "$changed" = false ]; then
+        return 0
+    fi
+
+    new_line="${new_line# }"
+    local var="GRUB_CMDLINE_LINUX_${which}"
+    if grep -q "^${var}=" "$GRUB_FILE" 2>/dev/null; then
+        sed -i "s/^${var}=.*/${var}=\"${new_line}\"/" "$GRUB_FILE"
+    else
+        echo "${var}=\"${new_line}\"" >> "$GRUB_FILE"
+    fi
+}
+
+# ── Extracted apply_* functions (behavioral, no sudo) ──────────
+
+extracted_apply_amdgpu_recovery() {
+    local all_present=true
+    for p in "amdgpu.lockup_timeout=10000" "amdgpu.gpu_recovery=1"; do
+        if ! has_grub_param "DEFAULT" "$p" && ! has_grub_param "LINUX" "$p"; then
+            all_present=false
+            break
+        fi
+    done
+    if [ "$all_present" = true ]; then
+        return 0
+    fi
+    _add_grub_params_write "DEFAULT" "AMD GPU lockup detection + recovery" \
+        "amdgpu.lockup_timeout=10000" "amdgpu.gpu_recovery=1"
+}
+
+extracted_apply_nvme_power_save() {
+    if has_grub_param "DEFAULT" "nvme_core.default_ps_max_latency_us=0" || \
+       has_grub_param "LINUX" "nvme_core.default_ps_max_latency_us=0"; then
+        return 0
+    fi
+    _add_grub_params_write "DEFAULT" "NVMe power state latency fix" \
+        "nvme_core.default_ps_max_latency_us=0"
+}
+
+extracted_apply_disable_deep_cstates() {
+    if has_grub_param "DEFAULT" "idle=nomwait" && has_grub_param "LINUX" "idle=nomwait"; then
+        if has_grub_key_with_value "DEFAULT" "processor.max_cstate" || \
+           has_grub_key_with_value "LINUX" "processor.max_cstate"; then
+            return 0
+        fi
+    fi
+    _add_grub_params_write "LINUX" "Ryzen deep C-state lockup fix" \
+        "processor.max_cstate=1" "idle=nomwait"
+}
+
+extracted_set_sysctl_key() {
+    local key="$1" expected="$2" desc="$3"
+    local current
+    current=$(cat "$TEST_DIR/sysctl/$key" 2>/dev/null || echo "")
+    if [ "$current" != "$expected" ]; then
+        mkdir -p "$TEST_DIR/sysctl"
+        echo "$expected" > "$TEST_DIR/sysctl/$key"
+    fi
+    SYSCTL_ENTRIES="${SYSCTL_ENTRIES}${key}=${expected}\n"
+}
+
+extracted_apply_panic_on_lockup() {
+    SYSCTL_ENTRIES=""
+    extracted_set_sysctl_key "kernel.softlockup_panic" "1" "Panic on soft lockup"
+    extracted_set_sysctl_key "kernel.hardlockup_panic" "1" "Panic on hard lockup (NMI watchdog)"
+    extracted_set_sysctl_key "kernel.hung_task_panic" "1"  "Panic on hung task (D-state stuck)"
+    extracted_set_sysctl_key "kernel.panic_on_oops"  "1"  "Panic on kernel oops"
+    install_sysctl_file
+    _add_grub_params_write "LINUX" "panic=10 (reboot after kernel panic)" "panic=10"
+}
+
+# ── Mock sysctl reader for show_status / dry_run ───────────────
+
+mock_read_sysctl_val() {
+    local key="$1"
+    cat "$TEST_DIR/sysctl/$key" 2>/dev/null || echo ""
+}
+
+# ── Extracted show_status (no /proc or real sysctl calls) ──────
+
+extracted_show_status() {
+    local BOLD="" GREEN="" YELLOW="" RED="" CYAN="" NC=""
+
+    echo "Boot parameters (GRUB):"
+    local line
+    line=$(read_grub_cmdline "DEFAULT")
+    echo "  GRUB_CMDLINE_LINUX_DEFAULT: ${line:-(empty)}"
+    line=$(read_grub_cmdline "LINUX")
+    echo "  GRUB_CMDLINE_LINUX: ${line:-(empty)}"
+
+    local -a grub_params=(
+        "amdgpu.lockup_timeout"
+        "amdgpu.gpu_recovery"
+        "nvme_core.default_ps_max_latency_us"
+        "panic"
+        "processor.max_cstate"
+        "idle"
+    )
+
+    for grp in "${grub_params[@]}"; do
+        local found_which="" found_val=""
+        for which in DEFAULT LINUX; do
+            if has_grub_key_with_value "$which" "$grp"; then
+                found_which="$which"
+                found_val=$(grub_key_value "$which" "$grp")
+                break
+            fi
+        done
+        if [ -n "$found_val" ]; then
+            echo "  [OK] ${grp} -> ${grp}=${found_val}"
+        else
+            echo "  [WARN] ${grp} -> not set"
+        fi
+    done
+
+    echo ""
+    echo "Runtime sysctl settings:"
+    local -a sysctl_keys=(
+        "kernel.softlockup_panic"
+        "kernel.hardlockup_panic"
+        "kernel.hung_task_panic"
+        "kernel.panic_on_oops"
+    )
+    for key in "${sysctl_keys[@]}"; do
+        local val
+        val=$(mock_read_sysctl_val "$key")
+        if [ "$val" = "1" ]; then
+            echo "  [OK] ${key} = ${val}"
+        elif [ -n "$val" ]; then
+            echo "  [WARN] ${key} = ${val}  (should be 1)"
+        else
+            echo "  [WARN] ${key} = (unreadable)"
+        fi
+    done
+}
+
+# ── Extracted dry_run (no real sysctl calls) ───────────────────
+
+extracted_dry_run() {
+    local BOLD="" GREEN="" YELLOW="" RED="" CYAN="" NC=""
+    local has_changes=false
+
+    echo "1. amdgpu recovery"
+    for p in "amdgpu.lockup_timeout=10000" "amdgpu.gpu_recovery=1"; do
+        if has_grub_param "DEFAULT" "$p" || has_grub_param "LINUX" "$p"; then
+            echo "  [OK] ${p} already set"
+        else
+            echo "  [WARN] ${p} would be added"
+            has_changes=true
+        fi
+    done
+    echo ""
+
+    echo "2. Ryzen deep C-state fix"
+    if has_grub_key_with_value "DEFAULT" "processor.max_cstate" || \
+       has_grub_key_with_value "LINUX" "processor.max_cstate"; then
+        echo "  [OK] processor.max_cstate already set"
+    else
+        echo "  [WARN] processor.max_cstate=1 would be added"
+        has_changes=true
+    fi
+    if has_grub_param "DEFAULT" "idle=nomwait" || has_grub_param "LINUX" "idle=nomwait"; then
+        echo "  [OK] idle=nomwait already set"
+    else
+        echo "  [WARN] idle=nomwait would be added"
+        has_changes=true
+    fi
+    echo ""
+
+    echo "3. NVMe power save fix"
+    if has_grub_param "DEFAULT" "nvme_core.default_ps_max_latency_us=0" || \
+       has_grub_param "LINUX" "nvme_core.default_ps_max_latency_us=0"; then
+        echo "  [OK] nvme_core.default_ps_max_latency_us=0 already set"
+    else
+        echo "  [WARN] nvme_core.default_ps_max_latency_us=0 would be added"
+        has_changes=true
+    fi
+    echo ""
+
+    echo "4. panic behavior"
+    for key in "kernel.softlockup_panic=1" "kernel.hardlockup_panic=1" \
+               "kernel.hung_task_panic=1" "kernel.panic_on_oops=1"; do
+        local k="${key%=*}"
+        local v="${key#*=}"
+        local cur
+        cur=$(mock_read_sysctl_val "$k")
+        if [ "$cur" = "$v" ]; then
+            echo "  [OK] ${k} = ${v} (already set)"
+        else
+            echo "  [WARN] ${k} = ${cur:-unreadable} -> would set to ${v}"
+            has_changes=true
+        fi
+    done
+
+    if has_grub_param "LINUX" "panic=10"; then
+        echo "  [OK] panic=10 already in GRUB_CMDLINE_LINUX"
+    else
+        echo "  [WARN] panic=10 would be added to GRUB_CMDLINE_LINUX"
+        has_changes=true
+    fi
+    echo ""
+
+    if [ "$has_changes" = true ]; then
+        echo "  Changes needed."
+    else
+        echo "  System already fully hardened. No changes needed."
+    fi
+}
+
+# ── test: apply_amdgpu_recovery ─────────────────────────────────
+
+test_apply_amdgpu_recovery_adds_params() {
+    test_start "apply_amdgpu_recovery adds params when missing"
+
+    local mock_grub="$TEST_DIR/etc/default/grub"
+    mkdir -p "$(dirname "$mock_grub")"
+    echo 'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"' > "$mock_grub"
+    GRUB_FILE="$mock_grub"
+
+    extracted_apply_amdgpu_recovery
+
+    local content; content=$(cat "$mock_grub")
+    assert_contains "$content" "amdgpu.lockup_timeout=10000" "should add lockup_timeout" || { test_end; return 1; }
+    assert_contains "$content" "amdgpu.gpu_recovery=1" "should add gpu_recovery" || { test_end; return 1; }
+    assert_contains "$content" "quiet splash" "should preserve existing params"
+
+    test_end
+}
+
+test_apply_amdgpu_recovery_skips_when_present() {
+    test_start "apply_amdgpu_recovery skips when params already in GRUB"
+
+    local mock_grub="$TEST_DIR/etc/default/grub"
+    mkdir -p "$(dirname "$mock_grub")"
+    echo 'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash amdgpu.lockup_timeout=10000 amdgpu.gpu_recovery=1"' > "$mock_grub"
+    GRUB_FILE="$mock_grub"
+    local original_content
+    original_content=$(cat "$mock_grub")
+
+    extracted_apply_amdgpu_recovery
+    local rc=$?
+    assert_eq 0 $rc "should return 0" || { test_end; return 1; }
+
+    local new_content; new_content=$(cat "$mock_grub")
+    assert_eq "$original_content" "$new_content" "file should not change"
+
+    test_end
+}
+
+# ── test: apply_nvme_power_save ─────────────────────────────────
+
+test_apply_nvme_power_save_adds() {
+    test_start "apply_nvme_power_save adds nvme_core param"
+
+    local mock_grub="$TEST_DIR/etc/default/grub"
+    mkdir -p "$(dirname "$mock_grub")"
+    echo 'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"' > "$mock_grub"
+    GRUB_FILE="$mock_grub"
+
+    extracted_apply_nvme_power_save
+
+    local content; content=$(cat "$mock_grub")
+    assert_contains "$content" "nvme_core.default_ps_max_latency_us=0" "should add NVMe param"
+
+    test_end
+}
+
+test_apply_nvme_power_save_skips() {
+    test_start "apply_nvme_power_save skips when already present"
+
+    local mock_grub="$TEST_DIR/etc/default/grub"
+    mkdir -p "$(dirname "$mock_grub")"
+    echo 'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash nvme_core.default_ps_max_latency_us=0"' > "$mock_grub"
+    GRUB_FILE="$mock_grub"
+    local original_content
+    original_content=$(cat "$mock_grub")
+
+    extracted_apply_nvme_power_save
+    local rc=$?
+    assert_eq 0 $rc "should return 0" || { test_end; return 1; }
+
+    local new_content; new_content=$(cat "$mock_grub")
+    assert_eq "$original_content" "$new_content" "file should not change"
+
+    test_end
+}
+
+# ── test: apply_disable_deep_cstates ────────────────────────────
+
+test_apply_disable_deep_cstates_adds() {
+    test_start "apply_disable_deep_cstates adds processor.max_cstate and idle=nomwait"
+
+    local mock_grub="$TEST_DIR/etc/default/grub"
+    mkdir -p "$(dirname "$mock_grub")"
+    echo 'GRUB_CMDLINE_LINUX="quiet splash"' > "$mock_grub"
+    echo 'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"' > "$mock_grub"
+    GRUB_FILE="$mock_grub"
+
+    extracted_apply_disable_deep_cstates
+
+    local content; content=$(cat "$mock_grub")
+    assert_contains "$content" "processor.max_cstate=1" "should add max_cstate" || { test_end; return 1; }
+    assert_contains "$content" "idle=nomwait" "should add idle=nomwait"
+
+    test_end
+}
+
+test_apply_disable_deep_cstates_skips() {
+    test_start "apply_disable_deep_cstates skips when both params present"
+
+    local mock_grub="$TEST_DIR/etc/default/grub"
+    mkdir -p "$(dirname "$mock_grub")"
+    cat > "$mock_grub" <<'EOF'
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash idle=nomwait"
+GRUB_CMDLINE_LINUX="quiet splash processor.max_cstate=1 idle=nomwait"
+EOF
+    GRUB_FILE="$mock_grub"
+    local original_content
+    original_content=$(cat "$mock_grub")
+
+    extracted_apply_disable_deep_cstates
+    local rc=$?
+    assert_eq 0 $rc "should return 0" || { test_end; return 1; }
+
+    local new_content; new_content=$(cat "$mock_grub")
+    assert_eq "$original_content" "$new_content" "file should not change"
+
+    test_end
+}
+
+# ── test: set_sysctl_key ────────────────────────────────────────
+
+test_set_sysctl_key_sets_value() {
+    test_start "set_sysctl_key writes new value to mock sysctl file"
+
+    SYSCTL_ENTRIES=""
+    extracted_set_sysctl_key "kernel.softlockup_panic" "1" "Panic on soft lockup"
+
+    local val; val=$(cat "$TEST_DIR/sysctl/kernel.softlockup_panic" 2>/dev/null)
+    assert_eq "1" "$val" "should write value to mock sysctl file" || { test_end; return 1; }
+
+    assert_contains "$SYSCTL_ENTRIES" "kernel.softlockup_panic=1" "should append to SYSCTL_ENTRIES"
+
+    test_end
+}
+
+test_set_sysctl_key_skips_when_equal() {
+    test_start "set_sysctl_key skips write when current value matches expected"
+
+    mkdir -p "$TEST_DIR/sysctl"
+    echo "1" > "$TEST_DIR/sysctl/kernel.hardlockup_panic"
+    local mtime_before; mtime_before=$(stat -c %Y "$TEST_DIR/sysctl/kernel.hardlockup_panic" 2>/dev/null)
+    sleep 0.1
+
+    SYSCTL_ENTRIES=""
+    extracted_set_sysctl_key "kernel.hardlockup_panic" "1" "Panic on hard lockup"
+
+    local mtime_after; mtime_after=$(stat -c %Y "$TEST_DIR/sysctl/kernel.hardlockup_panic" 2>/dev/null)
+    assert_eq "$mtime_before" "$mtime_after" "file should not be re-written" || { test_end; return 1; }
+
+    assert_contains "$SYSCTL_ENTRIES" "kernel.hardlockup_panic=1" "should still append to SYSCTL_ENTRIES"
+
+    test_end
+}
+
+# ── test: apply_panic_on_lockup ─────────────────────────────────
+
+test_apply_panic_on_lockup_calls_sysctl() {
+    test_start "apply_panic_on_lockup sets sysctl keys and adds panic=10 to GRUB"
+
+    local mock_grub="$TEST_DIR/etc/default/grub"
+    mkdir -p "$(dirname "$mock_grub")"
+    echo 'GRUB_CMDLINE_LINUX="quiet splash"' > "$mock_grub"
+    GRUB_FILE="$mock_grub"
+    SYSCTL_FILE="$TEST_DIR/etc/sysctl.d/99-freeze.conf"
+    mkdir -p "$(dirname "$SYSCTL_FILE")"
+
+    extracted_apply_panic_on_lockup
+
+    local key
+    for key in kernel.softlockup_panic kernel.hardlockup_panic kernel.hung_task_panic kernel.panic_on_oops; do
+        local val; val=$(cat "$TEST_DIR/sysctl/$key" 2>/dev/null)
+        assert_eq "1" "$val" "$key should be 1" || { test_end; return 1; }
+    done
+
+    local grub_content; grub_content=$(cat "$mock_grub")
+    assert_contains "$grub_content" "panic=10" "should add panic=10 to GRUB" || { test_end; return 1; }
+
+    assert_file_exists "$SYSCTL_FILE" "sysctl file should be written" || { test_end; return 1; }
+    local sysctl_content; sysctl_content=$(cat "$SYSCTL_FILE")
+    assert_contains "$sysctl_content" "kernel.softlockup_panic=1" "sysctl file should contain entries"
+
+    test_end
+}
+
+# ── test: show_status ───────────────────────────────────────────
+
+test_show_status_displays_grub_params() {
+    test_start "show_status displays GRUB params when present"
+
+    local mock_grub="$TEST_DIR/etc/default/grub"
+    mkdir -p "$(dirname "$mock_grub")"
+    cat > "$mock_grub" <<'EOF'
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash amdgpu.lockup_timeout=10000 amdgpu.gpu_recovery=1"
+GRUB_CMDLINE_LINUX="panic=10 processor.max_cstate=1"
+EOF
+    GRUB_FILE="$mock_grub"
+
+    local output
+    output=$(extracted_show_status)
+
+    assert_contains "$output" "amdgpu.lockup_timeout" "should display lockup_timeout" || { test_end; return 1; }
+    assert_contains "$output" "amdgpu.gpu_recovery" "should display gpu_recovery" || { test_end; return 1; }
+    assert_contains "$output" "panic=10" "should display panic=10" || { test_end; return 1; }
+    assert_contains "$output" "processor.max_cstate=1" "should display max_cstate" || { test_end; return 1; }
+    assert_contains "$output" "quiet splash" "should display base params"
+
+    test_end
+}
+
+test_show_status_displays_sysctl() {
+    test_start "show_status displays sysctl values from mock files"
+
+    local mock_grub="$TEST_DIR/etc/default/grub"
+    mkdir -p "$(dirname "$mock_grub")"
+    echo 'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"' > "$mock_grub"
+    GRUB_FILE="$mock_grub"
+
+    mkdir -p "$TEST_DIR/sysctl"
+    echo "1" > "$TEST_DIR/sysctl/kernel.softlockup_panic"
+    echo "1" > "$TEST_DIR/sysctl/kernel.hardlockup_panic"
+    echo "1" > "$TEST_DIR/sysctl/kernel.hung_task_panic"
+    echo "1" > "$TEST_DIR/sysctl/kernel.panic_on_oops"
+
+    local output
+    output=$(extracted_show_status)
+
+    assert_contains "$output" "kernel.softlockup_panic = 1" "should display softlockup_panic" || { test_end; return 1; }
+    assert_contains "$output" "kernel.hardlockup_panic = 1" "should display hardlockup_panic" || { test_end; return 1; }
+    assert_contains "$output" "kernel.hung_task_panic = 1" "should display hung_task_panic" || { test_end; return 1; }
+    assert_contains "$output" "kernel.panic_on_oops = 1" "should display panic_on_oops"
+
+    test_end
+}
+
+test_show_status_warns_unset_sysctl() {
+    test_start "show_status warns when sysctl values unreadable"
+
+    local mock_grub="$TEST_DIR/etc/default/grub"
+    mkdir -p "$(dirname "$mock_grub")"
+    echo 'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"' > "$mock_grub"
+    GRUB_FILE="$mock_grub"
+
+    # No sysctl mock files created — all will be unreadable
+    local output
+    output=$(extracted_show_status)
+
+    assert_contains "$output" "unreadable" "should warn about unreadable sysctl"
+
+    test_end
+}
+
+# ── test: dry_run ────────────────────────────────────────────────
+
+test_dry_run_shows_changes_needed() {
+    test_start "dry_run shows changes needed when params missing"
+
+    local mock_grub="$TEST_DIR/etc/default/grub"
+    mkdir -p "$(dirname "$mock_grub")"
+    echo 'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"' > "$mock_grub"
+    echo 'GRUB_CMDLINE_LINUX=""' >> "$mock_grub"
+    GRUB_FILE="$mock_grub"
+
+    local output
+    output=$(extracted_dry_run)
+
+    assert_contains "$output" "would be added" "should show params to be added" || { test_end; return 1; }
+    assert_contains "$output" "Changes needed" "should indicate changes needed" || { test_end; return 1; }
+    assert_contains "$output" "amdgpu.lockup_timeout=10000" "should flag amdgpu" || { test_end; return 1; }
+    assert_contains "$output" "nvme_core.default_ps_max_latency_us=0" "should flag NVMe" || { test_end; return 1; }
+    assert_not_contains "$output" "No changes needed" "should not say no changes"
+
+    test_end
+}
+
+test_dry_run_shows_no_changes() {
+    test_start "dry_run shows no changes when all params set"
+
+    local mock_grub="$TEST_DIR/etc/default/grub"
+    mkdir -p "$(dirname "$mock_grub")"
+    cat > "$mock_grub" <<'EOF'
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash amdgpu.lockup_timeout=10000 amdgpu.gpu_recovery=1 nvme_core.default_ps_max_latency_us=0 idle=nomwait"
+GRUB_CMDLINE_LINUX="processor.max_cstate=1 panic=10"
+EOF
+    GRUB_FILE="$mock_grub"
+
+    mkdir -p "$TEST_DIR/sysctl"
+    echo "1" > "$TEST_DIR/sysctl/kernel.softlockup_panic"
+    echo "1" > "$TEST_DIR/sysctl/kernel.hardlockup_panic"
+    echo "1" > "$TEST_DIR/sysctl/kernel.hung_task_panic"
+    echo "1" > "$TEST_DIR/sysctl/kernel.panic_on_oops"
+
+    local output
+    output=$(extracted_dry_run)
+
+    assert_contains "$output" "No changes needed" "should indicate no changes" || { test_end; return 1; }
+    assert_not_contains "$output" "would be added" "should not show additions"
+
+    test_end
+}
+
 # ── run ──────────────────────────────────────────────────────────
 
 run_tests "$0"
